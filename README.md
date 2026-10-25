@@ -19,14 +19,36 @@ git clone --recurse-submodules https://github.com/yinchengwang/StillEvolving.git
 # 或先 clone 再初始化
 git submodule update --init
 
-# 2) 按需拉取第三方库（不要用 --recursive，会拉 25 GB）
+# 2) 单独 clone reference 仓 —— 切勿加 --recurse-submodules，理由见下节
+git clone https://github.com/yinchengwang/reference.git ../reference
+```
+
+第 1 步的 `--recurse-submodules` 只作用于**本仓的 3 个 submodule**
+（projects / learning / ai-docs），是安全的 —— 最坏情况再多带出 3 个嵌套库
+（uthash + 两份 googletest，实测 checkout 约 8.9 MB、git 对象约 32 MB）。
+
+第 2 步的 `reference` **绝不能**加 `--recurse-submodules`：它内部还有 95 个上游 submodule。
+
+### 第三方库拉取（Task 5 后可用）
+
+```bash
+# 按 catalog.yml 拉取第三方库到指定 commit
 bash scripts/fetch-reference.sh --tier core
 ```
 
+> `scripts/fetch-reference.sh` 由 Task 5 交付。在此之前，上面第 2 步 clone 到的
+> `../reference` 只有清单层与笔记层，源码层要等该脚本就绪后再按需拉取。
+
 ## ⚠️ 禁止 `git submodule update --init --recursive`
 
-reference 内部有 95 个第三方库 submodule，递归初始化会一次性拉取约 25 GB / 53.6 万文件。
+**作用域是 `../reference` 仓。** reference 内部有 95 个第三方库 submodule，
+递归初始化会一次性拉取约 25 GB / 53.6 万文件。
 需要哪个库就用 `scripts/fetch-reference.sh --name <名字>` 单独拉取。
+
+在本仓（StillEvolving）内递归是安全的：本仓 `.gitmodules` 只有 3 条
+（projects / learning / ai-docs），且**不含** `reference`，
+递归最多再多带出 3 个嵌套库（uthash + 两份 googletest），
+与 reference 的 25 GB 不在一个量级。
 
 ## 目录规范
 

@@ -34,18 +34,17 @@ StillEvolving/
 ├── docs/
 │   ├── architecture.md          # 本文：目录规范总览
 │   └── superpowers/specs/        # 设计与计划文档
-├── scripts/
-│   ├── bootstrap.ps1            # Windows：一键拉起三个 submodule + 校验
-│   ├── bootstrap.sh             # POSIX 同上
-│   ├── fetch-reference.sh        # 按 catalog.yml 拉取第三方库到指定 commit
-│   ├── sync-catalog.py          # 从 .gitmodules 的 gitlink 重新生成 catalog 的 commit 字段
-│   └── check-consistency.py      # 校验四仓关系与 catalog 一致性
+├── scripts/                     # Task 5/6 创建，届时才有内容
+│   ├── bootstrap.ps1            # Task 6：Windows：一键拉起三个 submodule + 校验
+│   ├── bootstrap.sh             # Task 6：POSIX 同上
+│   ├── fetch-reference.sh       # Task 5：按 catalog.yml 拉取第三方库到指定 commit
+│   └── check_consistency.py     # Task 6：校验四仓关系与 catalog 一致性（下划线命名，Python 可 import）
 └── projects/                    # submodule → yinchengwang/projects.git
 ├── learning/                    # submodule → yinchengwang/learning.git
 └── ai-docs/                     # submodule → yinchengwang/AI-DOCS.git
 ```
 
-**为什么 `repos.yaml` 与 `.gitmodules` 并存**：`.gitmodules` 是 git 的原生机制，但表达不了 `fetch: manifest` 这种策略，也放不了"这个仓该放什么"的语义说明。`repos.yaml` 承载语义，`.gitmodules` 承载 git 事实。两者由 `check-consistency.py` 保证不漂移。
+**为什么 `repos.yaml` 与 `.gitmodules` 并存**：`.gitmodules` 是 git 的原生机制，但表达不了 `fetch: manifest` 这种策略，也放不了"这个仓该放什么"的语义说明。`repos.yaml` 承载语义，`.gitmodules` 承载 git 事实。两者由 `check_consistency.py` 保证不漂移。
 
 ### 2.2 projects（工程仓）
 
@@ -80,10 +79,10 @@ projects/
 │   ├── storage/                 # 存储设计
 │   └── (root)                   # 顶层文档
 ├── openspec/                    # ★ 变更与规格
-│   ├── specs/                   # 38 个 spec
+│   ├── specs/                   # 38 个顶层条目（32 个 r* 目录 + 2 个非 r* 目录 + engineering/ + learning/ + 2 个 .md）
 │   │   ├── engineering/         # 工程轨
 │   │   ├── learning/            # ★ 学习轨残留，待迁出
-│   │   └── (12 个单文件 spec)
+│   │   └── (32 个 r* 目录)
 │   ├── changes/                 # 8 个进行中变更
 │   ├── archived/
 │   └── config.yaml
@@ -176,7 +175,8 @@ reference/                      ← 仓库根
 ├── .gitignore
 ├── .gitmodules                 # 95 条 submodule 定义
 ├── scripts/
-│   └── check-wiki-refs.py      # 引用校验门禁
+│   ├── check-wiki-refs.py      # 引用校验门禁
+│   └── sync_catalog.py         # Task 4：从 .gitmodules 的 gitlink 重新生成 catalog 的 commit 字段（下划线命名，Python 可 import）
 ├── docs/                       # ★ 笔记层
 │   ├── db-wiki/                # 数据库源码笔记（分类索引 + gap-analysis 链接）
 │   ├── rag-wiki/               # RAG 框架笔记
@@ -254,8 +254,11 @@ reference/                      ← 仓库根
 
 > ⚠️ **禁止 `git submodule update --init --recursive`**
 >
-> reference 内部有 95 个第三方库 submodule，递归初始化会一次性拉取约 25 GB / 53.6 万文件。
+> **作用域是 `../reference` 仓。** reference 内部有 95 个第三方库 submodule，递归初始化会一次性拉取约 25 GB / 53.6 万文件。
 >
 > 需要哪个库就用 `scripts/fetch-reference.sh --name <名字>` 单独拉取。
+>
+> 在 StillEvolving 本仓内递归是安全的：本仓 `.gitmodules` 只有 3 条（projects / learning / ai-docs），
+> 且不含 `reference`。
 >
 > `git submodule add` 与 `git submodule status` **不带** `--recursive` 是安全的。
