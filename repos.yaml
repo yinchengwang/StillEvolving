@@ -1,0 +1,52 @@
+version: 1
+repos:
+  - name: projects
+    url: https://github.com/yinchengwang/projects.git
+    fetch: submodule
+    path: projects
+    role: 工程仓
+    must_contain: [engine, apps, docs, openspec, .ai, vendor, dataset, scripts, archive]
+    description: 自研数据库/搜索引擎引擎、微信小程序、项目级文档与 agent 规约
+    known_duplication:
+      - path: vendor/third_part/googletest
+        also_in: learning/third_part/googletest
+        note: 两仓各有一份 googletest，pin 可能不同，本次刻意保留两份不合并
+
+  - name: learning
+    url: https://github.com/yinchengwang/learning.git
+    fetch: submodule
+    path: learning
+    role: 学习仓
+    must_contain: [scaffold, notes, code-solutions, ds-c, arkts, interview, algo-c, progress, third_part]
+    description: Obsidian 学习 vault、脚手架工程、算法题解、课程进度
+    known_duplication:
+      - path: third_part/googletest
+        also_in: projects/vendor/third_part/googletest
+        note: 与 projects 重复，刻意保留两份（合并需两个仓各改 .gitmodules，风险高于收益）
+
+  - name: ai-docs
+    url: https://github.com/yinchengwang/AI-DOCS.git
+    fetch: submodule
+    path: ai-docs
+    role: AI 工作文档仓
+    must_contain: [templates, methodology, patterns, assets, prompts, agent-notes]
+    description: 跨项目复用的模板、方法论、模式、提示词与 agent 经验
+
+  - name: reference
+    url: https://github.com/yinchengwang/reference.git
+    fetch: manifest
+    path: ../reference
+    role: 第三方源码镜像 + 源码笔记
+    must_contain: [reference, docs, scripts]
+    description: 95 个第三方库的按需镜像 + 97 篇带精确行号引用的源码笔记
+    upstream:
+      manifest: reference/catalog.yml
+      lockfile: reference/fetch-manifest.txt
+      script: scripts/fetch-reference.sh
+      commit_field: commit
+      pin_status_field: pin_status
+      total: 95
+      notes: |
+        reference 不作为 submodule 挂载。递归克隆会拉取 25 GB / 53.6 万文件。
+        其上游 95 个库由 catalog.yml 声明 commit，按需克隆。
+        path 用 ../reference 表达"与 StillEvolving 平级但不在其内"。

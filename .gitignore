@@ -1,0 +1,13 @@
+# 构建产物
+build/
+build-*/
+CMakeFiles/
+CMakeCache.txt
+*.obj
+*.o
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+.venv/

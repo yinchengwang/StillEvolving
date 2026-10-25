@@ -1,0 +1,76 @@
+<!-- 历史版本：这是 repos.yaml 的早期草案，缺少 must_contain 字段。
+     现行版本见仓库根目录的 repos.yaml。 -->
+
+# repos.yaml —— 超级仓的仓库清单（示例草案，尚未落地）
+#
+# 作用：StillEvolving 父仓「记录」有哪些仓、每个仓干什么、拉取策略是什么。
+# 父仓不装这些仓的内容，它只装这份清单 + bootstrap 脚本。
+#
+# 关键区分（这是「按需取」的全部含义）：
+#   gitlink / 清单条目  = 记录（几 KB，进 git 历史）
+#   工作区实际检出      = 落地（GB 级，不进 git 历史）
+#   submodule --init --recursive  = 一次性把 95 个上游全部落地（25 GB）
+#   本方案              = 只落地你点名的那几个
+
+version: 1
+updated: 2026-10-25
+
+repos:
+  # ---- 自有仓：进 submodule 树，锁 commit ----
+  - name: projects
+    url: https://github.com/yinchengwang/projects.git
+    role: 工程代码（C++ 引擎 + 微信小程序）
+    fetch: submodule          # 父仓 .gitmodules 收录，clone --recursive 时落地
+    path: projects
+    notes: |
+      原 book 仓，GitHub 已改名。C++ 算法工程 + apps/ 四个小程序。
+      自带 LFS（dataset/ 673 MB），clone 时注意 GIT_LFS_SKIP_SMUDGE。
+
+  - name: learning
+    url: https://github.com/yinchengwang/learning.git
+    role: 学习文件（Obsidian 笔记 + 教学代码）
+    fetch: submodule
+    path: learning
+    notes: |
+      2162 个跟踪文件，notes/ 230 篇。自带 googletest submodule。
+      根 CMakeLists 内建双轨守卫，显式支持独立仓布局。
+
+  - name: ai-docs
+    url: https://github.com/yinchengwang/AI-DOCS.git
+    role: AI 的工作文档（跨项目复用部分）
+    fetch: submodule
+    path: ai-docs
+    notes: |
+      收录：通用 skill 源 / AI 工作方法论 / 跨项目分析与复盘。
+      不收录：.ai/ CLAUDE.md AGENTS.md openspec/ —— 那些是项目级上下文，
+              必须留在 projects 仓内，否则 agent 读不到规约。
+
+  # ---- 参考仓：清单驱动，按需取，不进 submodule 树 ----
+  - name: reference
+    url: https://github.com/yinchengwang/reference.git
+    role: 参考源码（上游镜像）+ 源码阅读笔记
+    fetch: manifest           # 由 scripts/fetch-reference.sh 按需拉取
+    path: reference
+    # 上游镜像清单在 reference/reference/catalog.yml（97 条，含 commit pin）
+    # 拉取粒度：model（relational/vector/...）或 name（faiss/redis/...）
+    upstream:
+      manifest: reference/catalog.yml
+      commit_field: commit    # 必填！见下方「为什么必须 pin」
+      lockfile: reference/reference/fetch-manifest.txt
+      total: 95
+      strategy: |
+        默认不拉。执行 fetch-reference.sh <分类或名字> 才落地对应上游。
+        拉取用 --depth 1 + 失败重试（复用 book/scripts/clone_retry.sh 的逻辑）。
+      why_pinned: |
+        docs/ 下的 wiki 是精确到行的引用（如 faiss/index_factory.cpp:1227），
+        行号对不上整篇笔记就失效。上游 commit 一旦漂移，引用全废。
+        scripts/check-wiki-refs.py 模式 A 直接校验「文件存在 + 行号未越界 +
+        目标行非空」，依赖的就是这个 pin。
+        → commit pin 从 .gitmodules 的 gitlink 迁到 catalog.yml 的 commit 字段。
+
+# ---- 仓库内部还各带一层 submodule，由各自仓自理 ----
+# projects  → vendor/third_part/googletest, engine/third_part/uthash
+# learning  → third_part/googletest
+# reference → 95 个上游镜像（本次要降级为 catalog.yml + 脚本）
+#
+# 这些嵌套层是「仓自己的事」，父仓不管。父仓只管到第二层。

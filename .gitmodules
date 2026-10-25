@@ -1,0 +1,9 @@
+[submodule "projects"]
+	path = projects
+	url = https://github.com/yinchengwang/projects.git
+[submodule "learning"]
+	path = learning
+	url = https://github.com/yinchengwang/learning.git
+[submodule "ai-docs"]
+	path = ai-docs
+	url = https://github.com/yinchengwang/AI-DOCS.git
