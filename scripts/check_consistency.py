@@ -11,8 +11,10 @@
 * ``must_contain`` 是**子集断言**：列出的每一项都必须存在，仓里多出的不算违规。
 * catalog 条目数是 97，但其中 oceanbase / pklite 无源码镜像（``source: none``）——
   校验用 ``source: mirror`` 的计数（95），不是总数（G16）。
+* 行尾注释（``fetch: submodule   # 说明``）必须识别 —— 设计文档 §6 与
+  ``docs/repos.yaml.sample.yaml`` 的书写习惯就是带行尾注释的。
 
-退出码：0 = 全部一致；1 = 有问题。
+退出码：0 = 全部一致（告警不算不一致）；1 = 有问题。
 """
 
 import argparse
@@ -24,12 +26,42 @@ import sys
 
 PIN_STATUSES = ("valid", "broken", "unresolvable")
 SOURCES = ("mirror", "none")
+FETCH_KINDS = ("submodule", "manifest")
 
 
 # ── YAML 子集解析 ─────────────────────────────────────────────────────────
+def _strip_comment(raw):
+    """去掉行尾注释。
+
+    ``#`` 只有在引号外、且前面是空白或位于行首时才是注释起点；
+    引号内的 ``#`` 是字面量。
+
+    为什么必须处理：设计文档 §6 与 ``docs/repos.yaml.sample.yaml`` 的写法是
+    ``fetch: submodule              # submodule | manifest`` ——
+    不识别行尾注释会让 ``fetch`` 的值带上 ``# comment``，
+    于是既匹配不上 ``submodule`` 也不匹配 ``manifest``，相关校验被**静默跳过**。
+    """
+    out = []
+    quote = None
+    for i, ch in enumerate(raw):
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            out.append(ch)
+            continue
+        if ch == "#" and (i == 0 or raw[i - 1] in " \t"):
+            break
+        out.append(ch)
+    return "".join(out)
+
+
 def _scalar(raw):
     """标量值 -> 字符串（YAML null 记为 None）。"""
-    value = raw.strip()
+    value = _strip_comment(raw).strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
         value = value[1:-1]
     if value in ("null", "Null", "NULL", "~", ""):
@@ -39,7 +71,7 @@ def _scalar(raw):
 
 def _inline_list(raw):
     """解析行内列表 ``[a, b, c]``。"""
-    body = raw.strip()
+    body = _strip_comment(raw).strip()
     if body.startswith("["):
         body = body[1:]
     if body.endswith("]"):
@@ -78,7 +110,7 @@ def _parse_nodes(lines, i, indent):
             i += 1
             if ":" in item_text:
                 key, _, val = item_text.partition(":")
-                item = {key.strip(): _scalar(val.strip())}
+                item = {key.strip(): _scalar(val)}
                 sub, i = _parse_nodes(lines, i, ind + 2)
                 if isinstance(sub, dict):
                     item.update(sub)
@@ -93,7 +125,8 @@ def _parse_nodes(lines, i, indent):
         if not isinstance(result, dict):
             break
         key, _, val = s.partition(":")
-        key, val = key.strip(), val.strip()
+        key = key.strip()
+        val = _strip_comment(val).strip()
         if val == "":
             i += 1
             sub, i = _parse_nodes(lines, i, ind + 1)
@@ -125,7 +158,7 @@ def parse_repos(text):
     """解析 repos.yaml，返回仓列表。
 
     必须能处理行内列表 ``must_contain: [a, b, c]``、嵌套映射（``upstream:``）、
-    列表（``known_duplication:``）、块标量（``notes: |``），
+    列表（``known_duplication:``）、块标量（``notes: |``）、行尾注释，
     并保留 ``path`` 的 ``../`` 前缀（reference 用的就是 ``../reference``）。
     """
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -144,6 +177,8 @@ def check_must_contain(repo_path, must):
     """
     missing = []
     for name in must or []:
+        if not name:
+            continue
         if not os.path.exists(os.path.join(repo_path, name)):
             missing.append(name)
     return missing
@@ -155,6 +190,8 @@ def load_sync_catalog(reference_root):
 
     不能用 ``import sync_catalog`` —— 不同仓，不在同一 sys.path 上。
     """
+    if not reference_root:
+        return None
     path = os.path.join(reference_root, "scripts", "sync_catalog.py")
     if not os.path.exists(path):
         return None
@@ -232,32 +269,48 @@ def resolve_upstream_paths(repo_entry, parent_root):
 
 # ── 子模块初始化状态 ─────────────────────────────────────────────────────
 def submodule_status(parent_root):
-    """返回 ``git submodule status`` 的输出（失败时返回空串）。"""
+    """返回 ``git submodule status`` 的输出；失败时返回 None（区别于「空输出」）。"""
     try:
         proc = subprocess.run(["git", "-C", parent_root, "submodule", "status"],
                               capture_output=True, text=True)
     except FileNotFoundError:
-        return ""
+        return None
+    if proc.returncode != 0:
+        return None
     return proc.stdout or ""
 
 
-def uninitialized_submodules(parent_root):
-    """列出未初始化（前缀为 '-'）的 submodule 路径。"""
-    out = []
-    for line in submodule_status(parent_root).split("\n"):
+def submodule_states(parent_root):
+    """返回 (未初始化的路径, 漂移的路径)。
+
+    ``-`` 前缀 = 未初始化；``+`` 前缀 = 工作树 HEAD 与 gitlink 记录的 pin 不一致
+    （漂移会破坏「pin 由 gitlink 保证」这个前提，同样要报出来）。
+    """
+    uninit, drifted = [], []
+    out = submodule_status(parent_root)
+    if out is None:
+        return uninit, drifted
+    for line in out.split("\n"):
         line = line.strip()
         if not line:
             continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
         if line.startswith("-"):
-            parts = line.split()
-            if len(parts) >= 2:
-                out.append(parts[1])
-    return out
+            uninit.append(parts[1])
+        elif line.startswith("+"):
+            drifted.append(parts[1])
+    return uninit, drifted
 
 
 # ── 主校验 ───────────────────────────────────────────────────────────────
 def check_all(parent_root):
-    """跑全部一致性检查，返回 (问题列表, 告警列表)。"""
+    """跑全部一致性检查，返回 (问题列表, 告警列表)。
+
+    问题列表的每一条形如 ``[仓库名] <出了什么问题>: <细节>``；
+    告警列表形如 ``[仓库名] clone_url 与 .gitmodules url 分歧: <名字>``。
+    """
     problems = []
     warnings = []
 
@@ -270,36 +323,73 @@ def check_all(parent_root):
         problems.append("[repos.yaml] 解析不出任何仓")
         return problems, warnings
 
-    # 2/3/4 —— 每个仓的目录、git 状态、must_contain
-    uninit = uninitialized_submodules(parent_root)
+    # 父仓的 submodule 状态（一次算好，别每个仓重算）
+    uninit, drifted = submodule_states(parent_root)
+    if submodule_status(parent_root) is None:
+        problems.append("[父仓] 不是 git 仓或 git submodule status 执行失败: %s" % parent_root)
+
+    # 父仓 .gitmodules ↔ repos.yaml 的 url（设计文档 §5.1：两者不得漂移）
+    parent_gitmodules = os.path.join(parent_root, ".gitmodules")
+    parent_urls = {}
+    if os.path.exists(parent_gitmodules):
+        with open(parent_gitmodules, "r", encoding="utf-8", newline="") as fh:
+            parent_urls = parse_gitmodules(fh.read())
+
     for repo in repos:
         name = repo.get("name") or "<未命名>"
-        rel = repo.get("path") or ""
+        rel = repo.get("path")
+        fetch = repo.get("fetch")
+
+        if not rel:
+            problems.append("[%s] 缺少 path 字段" % name)
+            continue
         repo_path = os.path.normpath(os.path.join(parent_root, rel))
+
+        # fetch 取值非法会让下面两类校验被静默跳过 —— 必须当错误报出来
+        if fetch not in FETCH_KINDS:
+            problems.append("[%s] fetch 取值非法: %r（只能是 submodule / manifest）" % (name, fetch))
+            continue
+
         if not os.path.exists(repo_path):
             problems.append("[%s] 仓目录不存在: %s" % (name, repo_path))
+            if rel in uninit:
+                problems.append("[%s] submodule 未初始化: %s" % (name, rel))
             continue
-        if repo.get("fetch") == "submodule":
+
+        if fetch == "submodule":
             if not os.path.isdir(os.path.join(repo_path, ".git")) and \
                not os.path.isfile(os.path.join(repo_path, ".git")):
                 problems.append("[%s] 不是有效的 git 仓: %s" % (name, repo_path))
             if rel in uninit:
                 problems.append("[%s] submodule 未初始化: %s" % (name, rel))
-        elif repo.get("fetch") == "manifest":
+            if rel in drifted:
+                problems.append("[%s] submodule 工作树与 pin 不一致（漂移）: %s" % (name, rel))
+            declared = repo.get("url")
+            actual = parent_urls.get(rel)
+            if declared and actual and declared.rstrip("/") != actual.rstrip("/"):
+                problems.append("[%s] repos.yaml 的 url 与 .gitmodules 不一致: %s != %s" % (
+                    name, declared, actual))
+        else:
             if not os.path.isdir(os.path.join(repo_path, "reference")):
                 problems.append("[%s] 缺少源码层目录 reference/: %s" % (name, repo_path))
+
         for missing in check_must_contain(repo_path, repo.get("must_contain")):
             problems.append("[%s] 缺失顶层项: %s" % (name, missing))
 
-    # 5/6/6b/7 —— reference 仓的 catalog / manifest / .gitmodules
+    # reference 仓的 catalog / manifest / .gitmodules
     for repo in repos:
         if repo.get("fetch") != "manifest":
             continue
         name = repo.get("name") or "<未命名>"
+        upstream = repo.get("upstream") or {}
+        if not upstream:
+            problems.append("[%s] fetch=manifest 但缺少 upstream 块" % name)
+            continue
         upstream_paths = resolve_upstream_paths(repo, parent_root)
         manifest_path = upstream_paths.get("manifest")
         lockfile_path = upstream_paths.get("lockfile")
         script_path = upstream_paths.get("script")
+        ref_root = os.path.normpath(os.path.join(parent_root, repo.get("path") or ""))
 
         if not manifest_path or not os.path.exists(manifest_path):
             problems.append("[%s] catalog 不存在: %s" % (name, manifest_path))
@@ -307,15 +397,14 @@ def check_all(parent_root):
         if script_path and not os.path.exists(script_path):
             problems.append("[%s] 拉取脚本不存在: %s" % (name, script_path))
 
-        sync = load_sync_catalog(repo.get("path") and
-                                 os.path.normpath(os.path.join(parent_root, repo["path"])))
+        sync = load_sync_catalog(ref_root)
         if sync is None:
             problems.append("[%s] 找不到 sync_catalog.py，无法校验 catalog" % name)
             continue
         with open(manifest_path, "r", encoding="utf-8", newline="") as fh:
             entries = sync.parse_catalog(fh.read())
 
-        # 6 —— pin_status 合法
+        # pin_status / source 合法
         for entry in entries:
             if entry.get("pin_status") not in PIN_STATUSES:
                 problems.append("[%s] pin_status 非法: %s = %r" % (
@@ -324,17 +413,18 @@ def check_all(parent_root):
                 problems.append("[%s] source 非法: %s = %r" % (
                     name, entry.get("name"), entry.get("source")))
 
-        # 5 —— source: mirror 的条目数 == upstream.total（不是总数 97）
-        total = (repo.get("upstream") or {}).get("total")
-        if total is not None:
+        # source: mirror 的条目数 == upstream.total（不是总数 97）
+        total = upstream.get("total")
+        if total is None:
+            problems.append("[%s] upstream 缺少 total，无法校验 catalog 条目数" % name)
+        else:
             mirror = sum(1 for e in entries if e.get("source") == "mirror")
             if mirror != int(total):
                 problems.append("[%s] catalog 中 source=mirror 的条目数 %d != repos.yaml 声明的 %s" % (
                     name, mirror, total))
 
-        # 6b —— clone_url 与 .gitmodules url 分歧：只告警
-        gitmodules_path = os.path.join(
-            os.path.normpath(os.path.join(parent_root, repo["path"])), ".gitmodules")
+        # clone_url 与 .gitmodules url 分歧：只告警
+        gitmodules_path = os.path.join(ref_root, ".gitmodules")
         if os.path.exists(gitmodules_path):
             with open(gitmodules_path, "r", encoding="utf-8", newline="") as fh:
                 gitmodules_urls = parse_gitmodules(fh.read())
@@ -342,7 +432,7 @@ def check_all(parent_root):
             for divergent in check_clone_url_divergence(entries, gitmodules_urls, model_of):
                 warnings.append("[%s] clone_url 与 .gitmodules url 分歧: %s" % (name, divergent))
 
-        # 7 —— fetch-manifest.txt 与 catalog 生成结果一致
+        # fetch-manifest.txt 与 catalog 生成结果一致
         if not lockfile_path or not os.path.exists(lockfile_path):
             problems.append("[%s] manifest 不存在: %s" % (name, lockfile_path))
         else:
@@ -365,13 +455,13 @@ def main(argv=None):
     problems, warnings = check_all(parent_root)
 
     for line in warnings:
-        print("WARN " + line)
+        print(line)
+    for line in problems:
+        print(line)
     if problems:
-        print("发现 %d 处问题：" % len(problems))
-        for line in problems:
-            print("  " + line)
+        print("校验未通过：%d 处问题，%d 条告警" % (len(problems), len(warnings)))
         return 1
-    print("四仓一致")
+    print("四仓一致（%d 条告警）" % len(warnings))
     return 0
 
 
