@@ -1,0 +1,13 @@
+# 默认：让 git 按内容判断文本文件（已有 CRLF 的保持 CRLF，其余检出为 LF）
+* text=auto
+
+# shell 脚本必须是 LF —— CRLF 会让 bash 报 `$'\r': command not found`
+*.sh    text eol=lf
+
+# PowerShell 脚本用 CRLF（Windows 惯例）
+# BOM 必须保留：Windows PowerShell 5.1 会把无 BOM 的 .ps1 按系统 ANSI 码页
+# （本机 CP936）解码，中文的多字节序列会吞掉后面的引号 → 整段 ParserError
+*.ps1   text eol=crlf
+
+# Python 脚本用 LF（Windows 与 Linux 通用）
+*.py    text eol=lf

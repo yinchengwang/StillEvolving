@@ -16,6 +16,17 @@ cat > "$TMP/bin/git" <<'GITEOF'
 #!/bin/bash
 # 记录调用并模拟成功
 echo "git $@" >> "$GIT_CALL_LOG"
+
+# 取 -C <dir> 的 <dir>
+cd_dir() {
+    local prev="" a
+    for a in "$@"; do
+        if [ "$prev" = "-C" ]; then echo "$a"; return 0; fi
+        prev="$a"
+    done
+    echo ""
+}
+
 case "$*" in
   *"rev-parse HEAD"*)
       # FAKE_HEAD 显式指定时用它；否则首次读到「不是 pin」的 HEAD，
@@ -23,6 +34,25 @@ case "$*" in
       if [ -n "${FAKE_HEAD:-}" ]; then echo "$FAKE_HEAD"
       elif [ -f "$FAKE_STATE" ]; then echo "$FAKE_PIN"
       else echo "$FAKE_WRONG"
+      fi
+      ;;
+  *"rev-parse --show-toplevel"*)
+      # 该目录本身就是工作树根
+      cd_dir "$@"
+      ;;
+  *"submodule update"*)
+      # 真实的 submodule update 会建出工作树与 .git 文件 —— 模拟它，
+      # 否则脚本的「未 init 回退」分支永远走不到
+      root="$(cd_dir "$@")"
+      path=""
+      for a in "$@"; do
+        case "$a" in
+          reference/*) path="$a" ;;
+        esac
+      done
+      if [ -n "$root" ] && [ -n "$path" ]; then
+        mkdir -p "$root/$path"
+        [ -e "$root/$path/.git" ] || : > "$root/$path/.git"
       fi
       ;;
   *"checkout"*) touch "$FAKE_STATE" ;;
@@ -51,6 +81,9 @@ echo "== T1: --check 不执行任何 git 操作 =="
 OUT="$("$FETCH" --check 2>&1)"; RC=$?
 [ $RC -eq 0 ] && ok "退出码 0" || bad "退出码 $RC，应为 0"
 [ ! -s "$GIT_CALL_LOG" ] && ok "未调用 git" || bad "调用了 git: $(cat "$GIT_CALL_LOG")"
+# 计数行是计划里逐字规定的验收输出，必须能被 grep 到
+echo "$OUT" | grep -q "97 entries, 91 valid, 4 broken, 2 unresolvable" \
+    && ok "计数行与约定一致" || bad "计数行不符: $OUT"
 
 echo "== T2: broken 条目被跳过并告警 =="
 : > "$GIT_CALL_LOG"
@@ -84,11 +117,38 @@ OUT="$(REFERENCE_ROOT="$FAKE_REF" "$FETCH" --name sqlite3 2>&1)"; RC=$?
 [ $RC -ne 0 ] && ok "未落到 pin 时退出码非 0" || bad "未落到 pin 却报成功：$OUT"
 echo "$OUT" | grep -qi "pinned commit" && ok "报出未落到 pinned commit" || bad "未报 pin 不符：$OUT"
 [ -f "$FAKE_REF/reference/AUDIT.md" ] && ok "失败已记入 AUDIT.md" || bad "失败未记入 AUDIT.md"
+
+echo "== T5b: 回退取 commit 必须用 catalog 的 clone_url，不能用 submodule 的 origin =="
+# 这条是 C1 的回归测试：把 fetch 的地址改回 origin，套件必须变红
+grep -q "fetch --depth 1 -- https://github.com/sqlite/sqlite.git" "$GIT_CALL_LOG" \
+    && ok "回退用 catalog 的 clone_url 取 commit" || bad "回退没用 clone_url: $(cat "$GIT_CALL_LOG")"
+if grep -q "fetch --depth 1 origin" "$GIT_CALL_LOG"; then
+    bad "回退仍在用 submodule 的 origin: $(cat "$GIT_CALL_LOG")"
+else
+    ok "回退没有用 submodule 的 origin"
+fi
+grep -q "remote set-url origin https://github.com/sqlite/sqlite.git" "$GIT_CALL_LOG" \
+    && ok "把 submodule 的 origin 修成了 clone_url" || bad "未修正 origin: $(cat "$GIT_CALL_LOG")"
+
 # 去重：同一条失败不应被重复追加
 before=$(wc -l < "$FAKE_REF/reference/AUDIT.md")
 REFERENCE_ROOT="$FAKE_REF" "$FETCH" --name sqlite3 >/dev/null 2>&1
 after=$(wc -l < "$FAKE_REF/reference/AUDIT.md")
 [ "$before" = "$after" ] && ok "AUDIT.md 失败记录已去重" || bad "AUDIT.md 又追加了 $((after-before)) 行"
+
+echo "== T5c: 未 init 条目的回退路径也必须用 clone_url =="
+: > "$GIT_CALL_LOG"
+export FAKE_HEAD="0000000000000000000000000000000000000000"
+REFERENCE_ROOT="$FAKE_REF" "$FETCH" --name duckdb >/dev/null 2>&1
+grep -q "submodule update --depth 1 reference/embedded/duckdb" "$GIT_CALL_LOG" \
+    && ok "duckdb 走了 submodule update" || bad "duckdb 未走 submodule update: $(cat "$GIT_CALL_LOG")"
+grep -q "fetch --depth 1 -- https://github.com/duckdb/duckdb.git" "$GIT_CALL_LOG" \
+    && ok "未 init 条目的回退也用 catalog 的 clone_url" || bad "回退没用 clone_url: $(cat "$GIT_CALL_LOG")"
+if grep -q "fetch --depth 1 origin" "$GIT_CALL_LOG"; then
+    bad "回退仍在用 submodule 的 origin"
+else
+    ok "回退没有用 submodule 的 origin"
+fi
 
 echo "== T6: 幂等 —— 第二次运行不再拉取（F1） =="
 : > "$GIT_CALL_LOG"

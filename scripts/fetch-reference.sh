@@ -111,9 +111,9 @@ run_check() {
     local rows total valid broken unresolvable
     rows="$(catalog_rows)"
     total="$(printf '%s\n' "$rows" | grep -c '[^[:space:]]' || true)"
-    valid="$(printf '%s\n' "$rows" | awk -F'\t' '$6=="valid"' | grep -c '[^[:space:]]' || true)"
-    broken="$(printf '%s\n' "$rows" | awk -F'\t' '$6=="broken"' | grep -c '[^[:space:]]' || true)"
-    unresolvable="$(printf '%s\n' "$rows" | awk -F'\t' '$6=="unresolvable"' | grep -c '[^[:space:]]' || true)"
+    valid="$(printf '%s\n' "$rows" | awk -F'\x1f' '$6=="valid"' | grep -c '[^[:space:]]' || true)"
+    broken="$(printf '%s\n' "$rows" | awk -F'\x1f' '$6=="broken"' | grep -c '[^[:space:]]' || true)"
+    unresolvable="$(printf '%s\n' "$rows" | awk -F'\x1f' '$6=="unresolvable"' | grep -c '[^[:space:]]' || true)"
 
     echo "$total entries, $valid valid, $broken broken, $unresolvable unresolvable"
 
@@ -180,6 +180,18 @@ target_path() {
     printf 'reference/%s/%s' "$1" "$2"
 }
 
+# 判断 $dir 本身是不是一个 git 工作树根。
+# 必要性：`git -C <普通目录>` 会向上找到父仓，于是 `git -C "$dir" remote set-url origin X`
+# 会把**父仓的 origin** 改掉。用 --show-toplevel 与 $dir 比对即可区分
+# 「$dir 自己就是工作树根」与「向上走到了父仓」。
+is_worktree_root() {
+    local d="$1" top
+    [ -n "$d" ] && [ -d "$d" ] || return 1
+    top="$(git -C "$d" rev-parse --show-toplevel 2>/dev/null || true)"
+    [ -n "$top" ] || return 1
+    [ "$(cd "$d" && pwd -P)" = "$(cd "$top" && pwd -P)" ]
+}
+
 audit() {
     # 追加失败记录到 AUDIT.md（同一失败不重复追加，否则每次 --all 都会堆 91 行）
     local name="$1" reason="$2"
@@ -193,7 +205,7 @@ audit() {
 
 fetch_one() {
     local n="$1" m="$2" cu="$3" cm="$4" ps="$5" src="$6"
-    local path dir head
+    local path dir head cur_origin
 
     case "$ps" in
         broken)
@@ -213,6 +225,13 @@ fetch_one() {
     dir="$REFERENCE_ROOT/$path"
 
     if [ -e "$dir/.git" ]; then
+        # 只在 $dir 自己就是工作树根时才动它 —— `git -C <普通目录>` 会向上找到父仓，
+        # 那样 `remote set-url origin` 会把父仓的 origin 改掉
+        if ! is_worktree_root "$dir"; then
+            echo "  FAIL $n: $dir 不是独立的工作树根（拒绝操作，避免误改父仓 remote）"
+            audit "$n" "$dir 不是独立工作树根，拒绝操作"
+            FAIL_COUNT=$((FAIL_COUNT+1)); FAILED_NAMES="$FAILED_NAMES $n"; return 1
+        fi
         # 已 init —— 幂等判断：HEAD 已是 pin 就跳过（F1）
         head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
         if [ "$head" = "$cm" ]; then
@@ -233,6 +252,9 @@ fetch_one() {
                 echo "  OK $n → ${cm:0:8}"
                 OK_COUNT=$((OK_COUNT+1)); return 0
             fi
+            echo "  FAIL $n: 未落到 pinned commit（期望 ${cm:0:8}，实际 ${head:0:8}）"
+            audit "$n" "未落到 pinned commit（期望 ${cm:0:8}，实际 ${head:0:8}）"
+            FAIL_COUNT=$((FAIL_COUNT+1)); FAILED_NAMES="$FAILED_NAMES $n"; return 1
         fi
         echo "  FAIL $n: fetch/checkout 失败"
         audit "$n" "fetch/checkout 失败"
@@ -253,16 +275,14 @@ fetch_one() {
 
     # 落点校验：必须等于 pinned commit
     head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
-    if [ "$head" != "$cm" ]; then
+    if [ "$head" != "$cm" ] && is_worktree_root "$dir"; then
         # 回退：git submodule update 复用已存在的 .git/modules/<path> 克隆时**不会**更新
         # 那个克隆的 origin，而那个 origin 可能指向取不到该 pin 的旧镜像（mysql 就是这种）。
         # 所以直接用 catalog 的 clone_url 取 pinned commit。
-        if [ -e "$dir/.git" ]; then
-            git -C "$dir" remote set-url origin "$cu" >/dev/null 2>&1 || true
-            if git -C "$dir" fetch --depth 1 -- "$cu" "$cm" >/dev/null 2>&1 \
-               && git -C "$dir" checkout --detach "$cm" >/dev/null 2>&1; then
-                head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
-            fi
+        git -C "$dir" remote set-url origin "$cu" >/dev/null 2>&1 || true
+        if git -C "$dir" fetch --depth 1 -- "$cu" "$cm" >/dev/null 2>&1 \
+           && git -C "$dir" checkout --detach "$cm" >/dev/null 2>&1; then
+            head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
         fi
     fi
 
