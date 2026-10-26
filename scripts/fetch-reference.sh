@@ -67,13 +67,17 @@ MANIFEST="$REFERENCE_ROOT/reference/fetch-manifest.txt"
 AUDIT="$REFERENCE_ROOT/reference/AUDIT.md"
 
 # ── catalog 解析 ───────────────────────────────────────────────────────────
-# 输出 TSV：name \t model \t tier \t clone_url \t commit \t pin_status \t source
+# 输出用 \x1f（unit separator）分隔的字段：name ␟ model ␟ tier ␟ clone_url ␟ commit ␟ pin_status ␟ source
+# 用 \x1f 而不是 TAB 是因为 TAB 属于 IFS 空白字符 —— `IFS=$'\t' read` 会把连续 TAB
+# 当成一个分隔符，空字段会被吞掉并让后面的字段整体左移（clone_url 缺失时 commit
+# 会被当成 URL 写进 .git/config）。\x1f 不是空白字符，空字段能原样保留。
 # 兼容 CRLF 与 LF（G4）；不依赖任何第三方 YAML 库（G11）。
+SEP=$'\x1f'
 catalog_rows() {
     sed 's/\r$//' "$CATALOG" | awk '
     function emit() {
         if (name != "")
-            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+            printf "%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n", \
                    name, model, tier, clone_url, commit, pin_status, source
     }
     BEGIN {
@@ -116,8 +120,10 @@ run_check() {
     local rc=0
 
     # 字段完整性
-    while IFS=$'\t' read -r n m t cu cm ps src; do
+    while IFS="$SEP" read -r n m t cu cm ps src; do
         [ -z "$n" ] && continue
+        [ "$cu" = "null" ] && cu=""
+        [ "$cm" = "null" ] && cm=""
         case "$ps" in
             valid)
                 if ! printf '%s' "$cm" | grep -Eq '^[0-9a-f]{40}$'; then
@@ -148,7 +154,7 @@ run_check() {
     else
         local expected actual
         # 空值在 manifest 里写作 '-'（与 YAML null 区分开）
-        expected="$(printf '%s\n' "$rows" | awk -F'\t' 'BEGIN{OFS="\t"}
+        expected="$(printf '%s\n' "$rows" | awk -F'\x1f' 'BEGIN{OFS="\t"}
             {
                 cu = ($4 == "" || $4 == "null") ? "-" : $4
                 cm = ($5 == "" || $5 == "null") ? "-" : $5
@@ -175,8 +181,14 @@ target_path() {
 }
 
 audit() {
+    # 追加失败记录到 AUDIT.md（同一失败不重复追加，否则每次 --all 都会堆 91 行）
+    local name="$1" reason="$2"
     [ -d "$(dirname "$AUDIT")" ] || return 0
-    printf '%s\n' "$1" >> "$AUDIT"
+    local key="$name: $reason"
+    if [ -f "$AUDIT" ] && grep -Fq -- "$key" "$AUDIT"; then
+        return 0
+    fi
+    printf -- '- %s %s: %s\n' "$(date +%Y-%m-%d)" "$name" "$reason" >> "$AUDIT"
 }
 
 fetch_one() {
@@ -208,14 +220,22 @@ fetch_one() {
             SKIP_COUNT=$((SKIP_COUNT+1)); return 0
         fi
         echo "FETCH $n: $cm"
+        # 修好可能指向旧镜像的 origin
+        cur_origin="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+        if [ "$cur_origin" != "$cu" ]; then
+            git -C "$dir" remote set-url origin "$cu" >/dev/null 2>&1 || true
+        fi
         # 从 catalog 的 clone_url 直接取 pinned commit（origin 可能指向取不到该 pin 的镜像）
-        if git -C "$dir" fetch --depth 1 "$cu" "$cm" >/dev/null 2>&1 \
+        if git -C "$dir" fetch --depth 1 -- "$cu" "$cm" >/dev/null 2>&1 \
            && git -C "$dir" checkout --detach "$cm" >/dev/null 2>&1; then
-            echo "  OK $n → ${cm:0:8}"
-            OK_COUNT=$((OK_COUNT+1)); return 0
+            head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+            if [ "$head" = "$cm" ]; then
+                echo "  OK $n → ${cm:0:8}"
+                OK_COUNT=$((OK_COUNT+1)); return 0
+            fi
         fi
         echo "  FAIL $n: fetch/checkout 失败"
-        audit "- $(date +%Y-%m-%d) fetch $n ($path): fetch/checkout 失败"
+        audit "$n" "fetch/checkout 失败"
         FAIL_COUNT=$((FAIL_COUNT+1)); FAILED_NAMES="$FAILED_NAMES $n"; return 1
     fi
 
@@ -223,24 +243,32 @@ fetch_one() {
     echo "FETCH $n: 初始化 submodule $path"
     git -C "$REFERENCE_ROOT" submodule init "$path" >/dev/null 2>&1 \
         || { echo "  FAIL $n: submodule init 失败"
-             audit "- $(date +%Y-%m-%d) fetch $n ($path): submodule init 失败"
+             audit "$n" "submodule init 失败"
              FAIL_COUNT=$((FAIL_COUNT+1)); FAILED_NAMES="$FAILED_NAMES $n"; return 1; }
 
     # 以 catalog 的 clone_url 为准（.gitmodules 的 url 可能取不到该 pin）
     git -C "$REFERENCE_ROOT" config "submodule.$path.url" "$cu" >/dev/null 2>&1 || true
 
-    if ! git -C "$REFERENCE_ROOT" submodule update --depth 1 "$path" >/dev/null 2>&1; then
-        # 回退：部分上游不接受按 SHA 的浅克隆，直接在 submodule 内取 pinned commit
+    git -C "$REFERENCE_ROOT" submodule update --depth 1 "$path" >/dev/null 2>&1 || true
+
+    # 落点校验：必须等于 pinned commit
+    head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+    if [ "$head" != "$cm" ]; then
+        # 回退：git submodule update 复用已存在的 .git/modules/<path> 克隆时**不会**更新
+        # 那个克隆的 origin，而那个 origin 可能指向取不到该 pin 的旧镜像（mysql 就是这种）。
+        # 所以直接用 catalog 的 clone_url 取 pinned commit。
         if [ -e "$dir/.git" ]; then
-            git -C "$dir" fetch --depth 1 origin "$cm" >/dev/null 2>&1 \
-                && git -C "$dir" checkout --detach "$cm" >/dev/null 2>&1 || true
+            git -C "$dir" remote set-url origin "$cu" >/dev/null 2>&1 || true
+            if git -C "$dir" fetch --depth 1 -- "$cu" "$cm" >/dev/null 2>&1 \
+               && git -C "$dir" checkout --detach "$cm" >/dev/null 2>&1; then
+                head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+            fi
         fi
     fi
 
-    head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
     if [ "$head" != "$cm" ]; then
         echo "  FAIL $n: 未落到 pinned commit（期望 ${cm:0:8}，实际 ${head:0:8}）"
-        audit "- $(date +%Y-%m-%d) fetch $n ($path): 未落到 pinned commit（期望 ${cm:0:8}，实际 ${head:0:8}）"
+        audit "$n" "未落到 pinned commit（期望 ${cm:0:8}，实际 ${head:0:8}）"
         FAIL_COUNT=$((FAIL_COUNT+1)); FAILED_NAMES="$FAILED_NAMES $n"; return 1
     fi
 
@@ -250,7 +278,7 @@ fetch_one() {
 
 # ── 选择待拉取的条目 ───────────────────────────────────────────────────────
 select_rows() {
-    catalog_rows | awk -F'\t' -v tier="$TIER" -v model="$MODEL" -v name="$NAME" -v all="$ALL" '
+    catalog_rows | awk -F'\x1f' -v tier="$TIER" -v model="$MODEL" -v name="$NAME" -v all="$ALL" '
     {
         sel = 1
         if (all != 1) {
@@ -295,7 +323,7 @@ run_fetch() {
     # 批量拉取：先打印清单，让人知道要拉什么
     if [ "$count" -gt 1 ]; then
         echo "==> 计划拉取 $count 个第三方库："
-        printf '%s\n' "$rows" | awk -F'\t' '{ printf "    %-12s %s\n", $1, $2 }'
+        printf '%s\n' "$rows" | awk -F'\x1f' '{ printf "    %-12s %s\n", $1, $2 }'
         echo "==> 磁盘预估：单库约 20~500 MB（大型库可达数百 MB），合计上限约 $((count * 500)) MB"
     fi
 
@@ -311,8 +339,10 @@ run_fetch() {
     fi
 
     local n m t cu cm ps src
-    while IFS=$'\t' read -r n m t cu cm ps src; do
+    while IFS="$SEP" read -r n m t cu cm ps src; do
         [ -z "$n" ] && continue
+        [ "$cu" = "null" ] && cu=""
+        [ "$cm" = "null" ] && cm=""
         fetch_one "$n" "$m" "$cu" "$cm" "$ps" "$src"
     done <<< "$rows"
 
