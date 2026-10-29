@@ -29,15 +29,32 @@ git clone https://github.com/yinchengwang/reference.git ../reference
 
 第 2 步的 `reference` **绝不能**加 `--recurse-submodules`：它内部还有 95 个上游 submodule。
 
-### 第三方库拉取（Task 5 后可用）
+### 第三方库拉取
 
 ```bash
 # 按 catalog.yml 拉取第三方库到指定 commit
 bash scripts/fetch-reference.sh --tier core
 ```
 
-> `scripts/fetch-reference.sh` 由 Task 5 交付。在此之前，上面第 2 步 clone 到的
-> `../reference` 只有清单层与笔记层，源码层要等该脚本就绪后再按需拉取。
+其他常用形式：
+
+```bash
+bash scripts/fetch-reference.sh --name faiss      # 拉单个库
+bash scripts/fetch-reference.sh --model vector    # 按分类拉
+bash scripts/fetch-reference.sh --check           # 只校验清单与磁盘，不拉取
+bash scripts/fetch-reference.sh --all --yes       # 全量（91 个，需二次确认）
+```
+
+> 第 2 步 clone 到的 `../reference` 只有**清单层与笔记层**，源码层一律由该脚本按需拉取。
+> 四个 `pin_status: broken` 的条目（druid / pebble / tdengine / dragonfly）会被跳过并告警 ——
+> 它们的 gitlink SHA 在上游不存在，拉 HEAD 冒充 pin 会让笔记里的行号引用失真。
+
+一键引导（拉 submodule + 校验四仓一致性）：
+
+```bash
+bash scripts/bootstrap.sh                 # POSIX
+scripts/bootstrap.ps1                     # Windows（PowerShell 执行）
+```
 
 ## ⚠️ 禁止 `git submodule update --init --recursive`
 

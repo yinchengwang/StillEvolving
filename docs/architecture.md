@@ -34,12 +34,14 @@ StillEvolving/
 ├── docs/
 │   ├── architecture.md          # 本文：目录规范总览
 │   └── superpowers/specs/        # 设计与计划文档
-├── scripts/                     # Task 5/6 创建，届时才有内容
-│   ├── bootstrap.ps1            # Task 6：Windows：一键拉起三个 submodule + 校验
-│   ├── bootstrap.sh             # Task 6：POSIX 同上
-│   ├── fetch-reference.sh       # Task 5：按 catalog.yml 拉取第三方库到指定 commit
-│   └── check_consistency.py     # Task 6：校验四仓关系与 catalog 一致性（下划线命名，Python 可 import）
-└── projects/                    # submodule → yinchengwang/projects.git
+├── scripts/                     # 引导、按需拉取、一致性校验
+│   ├── bootstrap.ps1            # Windows：一键拉起三个 submodule + 校验
+│   ├── bootstrap.sh             # POSIX：同上
+│   ├── fetch-reference.sh       # 按 catalog.yml 拉取第三方库到指定 commit
+│   ├── check_consistency.py     # 校验四仓关系与 catalog 一致性（下划线命名，Python 可 import）
+│   ├── test_fetch_reference.sh  # fetch-reference.sh 的契约测试（34 条断言）
+│   └── test_check_consistency.py # check_consistency.py 的单元测试（30 条）
+├── projects/                    # submodule → yinchengwang/projects.git
 ├── learning/                    # submodule → yinchengwang/learning.git
 └── ai-docs/                     # submodule → yinchengwang/AI-DOCS.git
 ```
@@ -79,10 +81,11 @@ projects/
 │   ├── storage/                 # 存储设计
 │   └── (root)                   # 顶层文档
 ├── openspec/                    # ★ 变更与规格
-│   ├── specs/                   # 38 个顶层条目（32 个 r* 目录 + 2 个非 r* 目录 + engineering/ + learning/ + 2 个 .md）
+│   ├── specs/                   # 25 个顶层条目（20 个 r* 目录 + 3 个非 r* 目录 + 2 个 .md）
 │   │   ├── engineering/         # 工程轨
-│   │   ├── learning/            # ★ 学习轨残留，待迁出
-│   │   └── (32 个 r* 目录)
+│   │   ├── kanban-statuses-json/  learning-card-rigor/   # 2 个非 r* 目录
+│   │   ├── (20 个 r* 目录)
+│   │   └── 学习轨（learning/ 与 12 个纯学习向 r*）已于 2026-10-26 迁至 learning 仓
 │   ├── changes/                 # 8 个进行中变更
 │   ├── archived/
 │   └── config.yaml
@@ -119,7 +122,8 @@ learning/
 │   ├── _templates/  _scripts/
 │   ├── Redis/  test/
 │   ├── HardWare/  _dashboard/  _meta/  diary/  linux/  paper/  sqlite/
-│   └── (顶层：README.md、各 ds-*.md 笔记、.sync-pipeline-state.json)
+│   ├── ds/                     # 5 个数据结构笔记（ds-art / radix-tree / rtree / skiplist / ttree）
+│   └── (顶层：README.md)       # .sync-pipeline-state.json 已取消跟踪并进 .gitignore
 ├── code-solutions/             # 算法题解
 ├── ds-c/                       # 数据结构 C 实现
 ├── arkts/                      # ArkTS
@@ -128,11 +132,10 @@ learning/
 ├── algo-c/
 ├── playground/
 ├── blog/  exam/  misc/  tools/
-├── progress/                   # r26-progress.md, r32-progress.md
+├── progress/                   # 9 个 r*-progress.md（r25/26/30/32/33/35/36/37/38）
 ├── scripts/
 ├── third_part/googletest/      # submodule — 与 projects 重复，刻意保留两份
 ├── articles/
-├── r25-progress.md … r38-progress.md   # ★ 散落待归入 progress/
 ├── CMakeLists.txt  LICENSE  README.md
 └── .gitignore  .gitmodules
 ```
@@ -158,7 +161,6 @@ ai-docs/
 │   └── process/
 ├── assets/                     # 通用资产
 │   ├── diagrams/
-│   ├── templates/
 │   └── scripts/
 ├── prompts/                    # 沉淀的提示词库
 ├── agent-notes/                # agent 交互经验与踩坑记录
@@ -176,14 +178,15 @@ reference/                      ← 仓库根
 ├── .gitmodules                 # 95 条 submodule 定义
 ├── scripts/
 │   ├── check-wiki-refs.py      # 引用校验门禁
-│   └── sync_catalog.py         # Task 4：从 .gitmodules 的 gitlink 重新生成 catalog 的 commit 字段（下划线命名，Python 可 import）
+│   ├── sync_catalog.py         # catalog ↔ manifest ↔ .gitmodules 三方同步与校验（下划线命名，Python 可 import）
+│   └── test_sync_catalog.py    # sync_catalog.py 的单元测试（34 条）
 ├── docs/                       # ★ 笔记层
 │   ├── db-wiki/                # 数据库源码笔记（分类索引 + gap-analysis 链接）
 │   ├── rag-wiki/               # RAG 框架笔记
 │   └── agent-wiki/             # Agent 框架笔记
 └── reference/                  # ★ 源码层（第二层 reference）
     ├── catalog.yml             # ★ 权威清单（含 commit pin）
-    ├── fetch-manifest.txt      # 拉取清单
+    ├── fetch-manifest.txt      # 5 列 pin lockfile（model/name/clone_url/commit/pin_status）
     ├── AUDIT.md                # 克隆审计记录
     ├── README.md               # 目录语义说明
     ├── ai/                     # agent/ 13 个 + rag/ 11 个
@@ -211,7 +214,7 @@ reference/                      ← 仓库根
 | 第三方源码镜像 | reference |
 | **跨项目**通用笔记、模板、方法论文档 | ai-docs |
 | 学习笔记、课程进度、算法题解 | learning |
-| 学习轨的 spec（`openspec/specs/learning/`） | learning（待迁） |
+| 学习轨的 spec（`openspec/specs/learning/`） | learning（**已迁出** 2026-10-26） |
 
 ### 3.2 learning 仓：什么该放这个仓
 
