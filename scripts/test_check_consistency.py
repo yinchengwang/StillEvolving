@@ -173,6 +173,56 @@ class TestCloneUrlDivergence(unittest.TestCase):
                                                {"mysql": "relational"})
         self.assertEqual(divergent, ["mysql"])
 
+    def test_entries_without_model_are_collected_not_silently_dropped(self):
+        """缺 model 的条目拼不出 reference/<model>/<name> 这个 key ——
+        必须能被调用方看到，否则这类条目会永远跳过分歧检查。"""
+        from check_consistency import check_clone_url_divergence
+        entries = [{"name": "orphan", "clone_url": "https://example/orphan.git"}]
+        unmatched = []
+        divergent = check_clone_url_divergence(entries, {}, {}, unmatched)
+        self.assertEqual(divergent, [])
+        self.assertEqual(unmatched, ["orphan"])
+
+    def test_unmatched_default_is_none_and_does_not_break_callers(self):
+        from check_consistency import check_clone_url_divergence
+        entries = [{"name": "orphan", "clone_url": "https://example/orphan.git"}]
+        self.assertEqual(check_clone_url_divergence(entries, {}, {}), [])
+
+
+class TestParseGitmodules(unittest.TestCase):
+    """.gitmodules 的键名必须精确匹配 —— `pathology = x` 不是 path。"""
+
+    def test_pathology_key_is_not_mistaken_for_path(self):
+        from check_consistency import parse_gitmodules
+        text = (
+            '[submodule "reference/vector/faiss"]\n'
+            '\tpath = reference/vector/faiss\n'
+            '\turl = https://github.com/facebookresearch/faiss.git\n'
+            '\tpathology = should-not-be-a-path\n'
+        )
+        urls = parse_gitmodules(text)
+        self.assertEqual(urls, {
+            "reference/vector/faiss": "https://github.com/facebookresearch/faiss.git"})
+
+    def test_url_without_path_is_ignored(self):
+        from check_consistency import parse_gitmodules
+        self.assertEqual(parse_gitmodules("\turl = https://example/x.git\n"), {})
+
+    def test_real_shape_two_submodules(self):
+        from check_consistency import parse_gitmodules
+        text = (
+            '[submodule "reference/vector/faiss"]\n'
+            '\tpath = reference/vector/faiss\n'
+            '\turl = https://github.com/facebookresearch/faiss.git\n'
+            '[submodule "reference/embedded/boltdb"]\n'
+            '\tpath = reference/embedded/boltdb\n'
+            '\turl = https://github.com/boltdb/bolt.git\n'
+        )
+        urls = parse_gitmodules(text)
+        self.assertEqual(len(urls), 2)
+        self.assertEqual(urls["reference/embedded/boltdb"],
+                         "https://github.com/boltdb/bolt.git")
+
 
 class TestTrailingComments(unittest.TestCase):
     """行尾注释必须识别 —— 设计文档 §6 与 docs/repos.yaml.sample.yaml 的书写习惯

@@ -205,7 +205,11 @@ def load_sync_catalog(reference_root):
 
 # ── .gitmodules ───────────────────────────────────────────────────────────
 def parse_gitmodules(text):
-    """解析 .gitmodules，返回 path -> url 映射。"""
+    """解析 .gitmodules，返回 path -> url 映射。
+
+    键名用**精确匹配**（``path`` / ``url``），不能用 ``startswith("path")`` ——
+    那会把 ``pathology = x`` 这类键名误当成 path，进而错配 url。
+    """
     urls = {}
     path = None
     for line in text.replace("\r\n", "\n").split("\n"):
@@ -214,29 +218,35 @@ def parse_gitmodules(text):
         if m:
             path = m.group(1)
             continue
-        if s.startswith("path") and "=" in s:
-            _, _, val = s.partition("=")
-            path = val.strip()
+        m = re.match(r'^(path|url)\s*=\s*(.*)$', s)
+        if not m:
             continue
-        if s.startswith("url") and "=" in s and path:
-            _, _, val = s.partition("=")
-            urls[path] = val.strip()
+        key, val = m.group(1), m.group(2).strip()
+        if key == "path":
+            path = val
+        elif path:
+            urls[path] = val
             path = None
     return urls
 
 
-def check_clone_url_divergence(entries, gitmodules_urls, model_of):
+def check_clone_url_divergence(entries, gitmodules_urls, model_of, unmatched=None):
     """找出 catalog 的 clone_url 与 .gitmodules 的 url 不一致的条目。
 
     两者职责不同（.gitmodules 是 git 原生记录，clone_url 是实测可按 SHA 拉到的地址），
     所以这是**告警不是错误**（设计文档 §11 决定 33）。
     返回分歧条目的 name 列表。
+
+    匹配依赖 G3 的固定布局 ``reference/<model>/<name>``。缺 ``model`` 的条目无法拼出
+    这个 key，会被跳过 —— 传入 ``unmatched`` 列表可以把它们收集起来，供调用方提示。
     """
     divergent = []
     for entry in entries:
         name = entry.get("name")
         model = model_of.get(name, entry.get("model"))
         if not name or not model:
+            if unmatched is not None:
+                unmatched.append(name or "<未命名条目>")
             continue
         clone_url = entry.get("clone_url")
         git_url = gitmodules_urls.get("reference/%s/%s" % (model, name))
@@ -399,7 +409,8 @@ def check_all(parent_root):
 
         sync = load_sync_catalog(ref_root)
         if sync is None:
-            problems.append("[%s] 找不到 sync_catalog.py，无法校验 catalog" % name)
+            problems.append("[%s] 找不到 %s，无法校验 catalog" % (
+                name, os.path.join(ref_root, "scripts", "sync_catalog.py")))
             continue
         with open(manifest_path, "r", encoding="utf-8", newline="") as fh:
             entries = sync.parse_catalog(fh.read())
@@ -429,8 +440,13 @@ def check_all(parent_root):
             with open(gitmodules_path, "r", encoding="utf-8", newline="") as fh:
                 gitmodules_urls = parse_gitmodules(fh.read())
             model_of = {e.get("name"): e.get("model") for e in entries}
-            for divergent in check_clone_url_divergence(entries, gitmodules_urls, model_of):
+            unmatched = []
+            for divergent in check_clone_url_divergence(entries, gitmodules_urls,
+                                                        model_of, unmatched):
                 warnings.append("[%s] clone_url 与 .gitmodules url 分歧: %s" % (name, divergent))
+            if unmatched:
+                warnings.append("[%s] 缺 model 无法比对 clone_url: %s"
+                                % (name, ", ".join(sorted(set(unmatched)))))
 
         # fetch-manifest.txt 与 catalog 生成结果一致
         if not lockfile_path or not os.path.exists(lockfile_path):

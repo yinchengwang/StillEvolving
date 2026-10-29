@@ -239,13 +239,21 @@ fetch_one() {
             SKIP_COUNT=$((SKIP_COUNT+1)); return 0
         fi
         echo "FETCH $n: $cm"
-        # 修好可能指向旧镜像的 origin
+        # 修好可能指向旧镜像的 origin；没有 origin 时补一个（否则后续 submodule update 无 remote 可用）
         cur_origin="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
-        if [ "$cur_origin" != "$cu" ]; then
+        if [ -z "$cur_origin" ]; then
+            git -C "$dir" remote add origin "$cu" >/dev/null 2>&1 || true
+        elif [ "$cur_origin" != "$cu" ]; then
             git -C "$dir" remote set-url origin "$cu" >/dev/null 2>&1 || true
         fi
+        # 已是完整克隆时不能加 --depth 1 —— 那会把它降级成浅克隆（丢失历史，且没有 --unshallow 退路）
+        depth_opt="--depth 1"
+        if [ "$(git -C "$dir" rev-parse --is-shallow-repository 2>/dev/null || echo true)" = "false" ]; then
+            depth_opt=""
+        fi
         # 从 catalog 的 clone_url 直接取 pinned commit（origin 可能指向取不到该 pin 的镜像）
-        if git -C "$dir" fetch --depth 1 -- "$cu" "$cm" >/dev/null 2>&1 \
+        # shellcheck disable=SC2086  # depth_opt 需要分词
+        if git -C "$dir" fetch $depth_opt -- "$cu" "$cm" >/dev/null 2>&1 \
            && git -C "$dir" checkout --detach "$cm" >/dev/null 2>&1; then
             head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
             if [ "$head" = "$cm" ]; then
@@ -274,12 +282,21 @@ fetch_one() {
     git -C "$REFERENCE_ROOT" submodule update --depth 1 "$path" >/dev/null 2>&1 || true
 
     # 落点校验：必须等于 pinned commit
-    head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+    # 先确认 $dir 自己是工作树根再读 HEAD —— 否则 `git -C <普通目录> rev-parse HEAD`
+    # 会向上走到 reference 仓，返回它的 HEAD，产生误导性诊断
+    head=""
+    if is_worktree_root "$dir"; then
+        head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+    fi
     if [ "$head" != "$cm" ] && is_worktree_root "$dir"; then
         # 回退：git submodule update 复用已存在的 .git/modules/<path> 克隆时**不会**更新
         # 那个克隆的 origin，而那个 origin 可能指向取不到该 pin 的旧镜像（mysql 就是这种）。
         # 所以直接用 catalog 的 clone_url 取 pinned commit。
-        git -C "$dir" remote set-url origin "$cu" >/dev/null 2>&1 || true
+        if [ -z "$(git -C "$dir" remote get-url origin 2>/dev/null || true)" ]; then
+            git -C "$dir" remote add origin "$cu" >/dev/null 2>&1 || true
+        else
+            git -C "$dir" remote set-url origin "$cu" >/dev/null 2>&1 || true
+        fi
         if git -C "$dir" fetch --depth 1 -- "$cu" "$cm" >/dev/null 2>&1 \
            && git -C "$dir" checkout --detach "$cm" >/dev/null 2>&1; then
             head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"

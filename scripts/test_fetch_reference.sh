@@ -40,6 +40,15 @@ case "$*" in
       # 该目录本身就是工作树根
       cd_dir "$@"
       ;;
+  *"rev-parse --is-shallow-repository"*)
+      # 默认当作浅克隆（保持 --depth 1 路径）；FAKE_FULL_REPO=1 时当作完整克隆
+      if [ "${FAKE_FULL_REPO:-0}" = "1" ]; then echo "false"; else echo "true"; fi
+      ;;
+  *"remote get-url origin"*)
+      # 默认模拟「submodule 的 origin 指向取不到该 pin 的旧镜像」；
+      # FAKE_ORIGIN="" 可模拟「根本没有 origin remote」
+      echo "${FAKE_ORIGIN-https://gitee.com/mirrors/sqlite.git}"
+      ;;
   *"submodule update"*)
       # 真实的 submodule update 会建出工作树与 .git 文件 —— 模拟它，
       # 否则脚本的「未 init 回退」分支永远走不到
@@ -135,6 +144,33 @@ before=$(wc -l < "$FAKE_REF/reference/AUDIT.md")
 REFERENCE_ROOT="$FAKE_REF" "$FETCH" --name sqlite3 >/dev/null 2>&1
 after=$(wc -l < "$FAKE_REF/reference/AUDIT.md")
 [ "$before" = "$after" ] && ok "AUDIT.md 失败记录已去重" || bad "AUDIT.md 又追加了 $((after-before)) 行"
+
+echo "== T5b2: 没有 origin remote 时必须 remote add，而不是静默失败 =="
+# 真实场景：某些 submodule 的 .git/modules/<path> 克隆没有 origin，
+# 此时 `remote set-url origin` 会静默失败（exit 2），后续 submodule update 无 remote 可用。
+: > "$GIT_CALL_LOG"
+export FAKE_ORIGIN=""
+export FAKE_HEAD="0000000000000000000000000000000000000000"
+REFERENCE_ROOT="$FAKE_REF" "$FETCH" --name sqlite3 >/dev/null 2>&1
+grep -q "remote add origin https://github.com/sqlite/sqlite.git" "$GIT_CALL_LOG" \
+    && ok "无 origin 时用 remote add 补上" || bad "无 origin 时没补 remote: $(cat "$GIT_CALL_LOG")"
+unset FAKE_ORIGIN
+unset FAKE_HEAD
+
+echo "== T5e: 已是完整克隆时不能加 --depth 1（会把完整克隆降级成浅克隆） =="
+: > "$GIT_CALL_LOG"
+export FAKE_FULL_REPO=1
+export FAKE_HEAD="0000000000000000000000000000000000000000"
+REFERENCE_ROOT="$FAKE_REF" "$FETCH" --name sqlite3 >/dev/null 2>&1
+if grep -q "fetch --depth 1" "$GIT_CALL_LOG"; then
+    bad "完整克隆仍被加了 --depth 1: $(cat "$GIT_CALL_LOG")"
+else
+    ok "完整克隆没有加 --depth 1"
+fi
+grep -q "https://github.com/sqlite/sqlite.git" "$GIT_CALL_LOG" \
+    && ok "完整克隆仍然从 catalog 的 clone_url 取" || bad "完整克隆没走 clone_url"
+unset FAKE_FULL_REPO
+unset FAKE_HEAD
 
 echo "== T5c: 未 init 条目的回退路径也必须用 clone_url =="
 : > "$GIT_CALL_LOG"
