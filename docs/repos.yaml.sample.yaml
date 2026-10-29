@@ -1,5 +1,5 @@
-<!-- 历史版本：这是 repos.yaml 的早期草案，缺少 must_contain 字段。
-     现行版本见仓库根目录的 repos.yaml。 -->
+# ⚠️ 历史版本：这是 repos.yaml 的早期草案，缺少 must_contain 字段。
+#    现行版本见仓库根目录的 repos.yaml —— 本文件仅作演进记录保留。
 
 # repos.yaml —— 超级仓的仓库清单（示例草案，尚未落地）
 #
