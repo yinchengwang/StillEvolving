@@ -39,8 +39,8 @@ StillEvolving/
 │   ├── bootstrap.sh             # POSIX：同上
 │   ├── fetch-reference.sh       # 按 catalog.yml 拉取第三方库到指定 commit
 │   ├── check_consistency.py     # 校验四仓关系与 catalog 一致性（下划线命名，Python 可 import）
-│   ├── test_fetch_reference.sh  # fetch-reference.sh 的契约测试（34 条断言）
-│   └── test_check_consistency.py # check_consistency.py 的单元测试（30 条）
+│   ├── test_fetch_reference.sh  # fetch-reference.sh 的契约测试（37 条断言）
+│   └── test_check_consistency.py # check_consistency.py 的单元测试（35 条）
 ├── projects/                    # submodule → yinchengwang/projects.git
 ├── learning/                    # submodule → yinchengwang/learning.git
 └── ai-docs/                     # submodule → yinchengwang/AI-DOCS.git
@@ -179,7 +179,7 @@ reference/                      ← 仓库根
 ├── scripts/
 │   ├── check-wiki-refs.py      # 引用校验门禁
 │   ├── sync_catalog.py         # catalog ↔ manifest ↔ .gitmodules 三方同步与校验（下划线命名，Python 可 import）
-│   └── test_sync_catalog.py    # sync_catalog.py 的单元测试（34 条）
+│   └── test_sync_catalog.py    # sync_catalog.py 的单元测试（41 条）
 ├── docs/                       # ★ 笔记层
 │   ├── db-wiki/                # 数据库源码笔记（分类索引 + gap-analysis 链接）
 │   ├── rag-wiki/               # RAG 框架笔记
