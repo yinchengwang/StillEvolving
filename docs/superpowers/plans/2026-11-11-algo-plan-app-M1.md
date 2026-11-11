@@ -129,6 +129,25 @@ projects/apps/algo-plan/
 > - `server/main.js`：`app.listen()` 补 `.catch`，启动失败打中文错误并 `process.exit(1)`。
 > - `tests/run-all.js`：输出里保留 node:test 的断言计数；没有测试套件时报错退出，不再空跑静默通过。
 > - 新增 `tests/errors.test.js` 与 `tests/harness.test.js`，覆盖上面这些错误路径。
+>
+> **Task 1 第二轮复审修复（2026-11-11）**：第一轮修复之后又冒出 4 个错误路径问题，本 Task 的代码块已再次修订：
+>
+> - `server/router.js`：删掉 `DRAIN_LIMIT_BYTES`（8MB）这个「读到就 `req.destroy()`」的兜底。
+>   它和第一轮修掉的那个 `req.destroy()` 是同一个坑：客户端还在上传时销毁 socket，内核回 RST，
+>   把已经写好的 413 响应冲掉，客户端只拿到 ECONNRESET（实测 10MB / 20MB 都复现）。
+>   现在一路排空到 body 结束，正常走 413 响应路径；这个 destroy 对内存也毫无保护作用
+>   （`chunks` 已经清空），只省带宽，而服务只监听 127.0.0.1。
+> - `server/app.js`：`catch` 里的 `headersSent` 分支补上 `console.error`。
+>   原来这个分支提前 `return`，把 500 兜底那条日志也跳过了，handler「先 `res.end()` 再 `throw`」
+>   会彻底静默、零日志。
+> - `server/main.js`：`catch` 按错误来源分支——`listen` 失败时端口被占用（`EADDRINUSE`）明确说「端口已被占用」，
+>   权限不足（`EACCES`）单独提示；异常来自 `.then` 回调内部（比如读 `app.learning` 炸了）时不再误报
+>   「无法监听端口」，而且不 `process.exit(1)`——那时服务已经监听成功，退出会把它杀掉。
+> - `tests/run-all.js`：`process.exit()` 改成 `process.exitCode`，
+>   免得 stderr 是异步管道时中文提示被截断；退出码照样非 0。
+> - `tests/errors.test.js` 补 4 条断言：10MB 大 body 收到 413 + 中文 JSON、响应发出后的异常必须留日志、
+>   端口被占用时文案点名「占用」、listen 成功后回调出错不再误报端口且不杀服务；
+>   `tests/harness.test.js` 补 1 条：中文提示的尾部不能被截断。
 - [ ] **Step 1: 写失败的冒烟测试**
 
 Create `projects/apps/algo-plan/tests/smoke.test.js`：
@@ -339,10 +358,16 @@ Create `projects/apps/algo-plan/tests/errors.test.js`：
 const test = require("node:test")
 const assert = require("node:assert")
 const path = require("node:path")
-const { spawnSync } = require("node:child_process")
+const { spawn, spawnSync } = require("node:child_process")
 
 const { createServer } = require("../server/app.js")
 const { HttpError, MAX_BODY_BYTES, readJsonBody } = require("../server/router.js")
+
+/**
+ * 病态大 body 的字节数：10MB，远超旧实现里 8MB 的「中途断连」阈值。
+ * 用它来钉住「大 body 也必须收到 413，而不是连接重置」这条契约。
+ */
+const HUGE_BODY_BYTES = 10 * 1024 * 1024
 
 /** 起一个服务，跑一段逻辑，最后一定关掉 */
 async function withServer(routes, fn) {
@@ -377,6 +402,24 @@ function captureConsoleError() {
   }
 }
 
+/** 等一会儿 */
+function sleep(ms) {
+  return new Promise(function (resolve) {
+    setTimeout(resolve, ms)
+  })
+}
+
+/** 轮询等待条件成立，最多等 5 秒；超时返回 null */
+async function waitFor(fn) {
+  const deadline = Date.now() + 5000
+  while (Date.now() < deadline) {
+    const value = fn()
+    if (value) return value
+    await sleep(50)
+  }
+  return null
+}
+
 test("请求体超过 1MB 时客户端收到 413 与中文 JSON", async function () {
   await withServer(
     [
@@ -402,6 +445,67 @@ test("请求体超过 1MB 时客户端收到 413 与中文 JSON", async function
       assert.strictEqual(body.error, "请求体过大（上限 1MB）")
     }
   )
+})
+
+test("超过 8MB 的大 body 也收到 413 与中文 JSON（不是连接重置）", async function () {
+  await withServer(
+    [
+      {
+        method: "POST",
+        pattern: "/api/echo",
+        handler: async function (req, res) {
+          await readJsonBody(req)
+          res.end("ok")
+        },
+      },
+    ],
+    async function (port) {
+      const big = "x".repeat(HUGE_BODY_BYTES)
+      const res = await fetch("http://127.0.0.1:" + port + "/api/echo", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: big,
+        signal: AbortSignal.timeout(30000),
+      })
+      // 旧实现：读到 8MB 兜底阈值就 req.destroy()，内核回 RST 把 413 响应冲掉，
+      // 客户端拿到的是 fetch failed / ECONNRESET，而不是 413
+      assert.strictEqual(res.status, 413, "大 body 也必须回 413，不能是连接重置")
+      const body = await res.json()
+      assert.strictEqual(body.error, "请求体过大（上限 1MB）")
+    }
+  )
+})
+
+test("响应已经发出之后再抛的异常，服务端必须留下日志", async function () {
+  const capture = captureConsoleError()
+  try {
+    await withServer(
+      [
+        {
+          method: "GET",
+          pattern: "/api/late",
+          handler: function (req, res) {
+            res.writeHead(200, { "content-type": "text/plain; charset=utf-8" })
+            res.end("ok")
+            // 响应已经落地才炸：状态码改不了了，但异常不能凭空消失
+            throw new TypeError("响应发出之后才炸的异常")
+          },
+        },
+      ],
+      async function (port) {
+        const res = await fetch("http://127.0.0.1:" + port + "/api/late")
+        assert.strictEqual(res.status, 200)
+        assert.strictEqual(await res.text(), "ok")
+      }
+    )
+    assert.ok(capture.lines.length > 0, "响应发出之后的异常也必须留下日志，不能被静默吞掉")
+    const text = capture.lines.join("\n")
+    assert.ok(text.indexOf("TypeError") !== -1, "日志里应有异常类型，实际：\n" + text)
+    assert.ok(text.indexOf("响应发出之后才炸的异常") !== -1, "日志里应有异常信息，实际：\n" + text)
+    assert.ok(text.indexOf("at ") !== -1, "日志里应有调用堆栈，实际：\n" + text)
+  } finally {
+    capture.restore()
+  }
 })
 
 test("handler 抛非 HttpError 时返回 500 中文文案", async function () {
@@ -602,6 +706,95 @@ test("main.js 启动失败时打印中文错误并以退出码 1 退出", functi
     "应该带上错误码，实际输出：\n" + res.stderr
   )
 })
+
+test("端口被占用时明确告诉用户是端口占用", function () {
+  const appPath = path.join(__dirname, "..", "server", "app.js")
+  const mainPath = path.join(__dirname, "..", "server", "main.js")
+  const script = [
+    "const appModule = require(" + JSON.stringify(appPath) + ")",
+    "appModule.createApp = function () {",
+    "  return {",
+    "    learning: { ok: false, reason: '测试' },",
+    "    listen: function () {",
+    "      const err = new Error('listen EADDRINUSE 127.0.0.1:5173')",
+    "      err.code = 'EADDRINUSE'",
+    "      return Promise.reject(err)",
+    "    },",
+    "  }",
+    "}",
+    "require(" + JSON.stringify(mainPath) + ").main()",
+  ].join("\n")
+  const res = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" })
+  const stderr = res.stderr || ""
+  assert.strictEqual(res.status, 1, "端口被占用时应以退出码 1 退出，实际输出：\n" + stderr)
+  assert.ok(
+    stderr.indexOf("端口") !== -1 && stderr.indexOf("占用") !== -1,
+    "端口被占用时必须明确说出来，实际输出：\n" + stderr
+  )
+})
+
+test("listen 成功但启动回调出错时，不再误报「无法监听端口」且不杀掉服务", async function () {
+  const appPath = path.join(__dirname, "..", "server", "app.js")
+  const mainPath = path.join(__dirname, "..", "server", "main.js")
+  const script = [
+    "const http = require('node:http')",
+    "const appModule = require(" + JSON.stringify(appPath) + ")",
+    "appModule.createApp = function () {",
+    "  return {",
+    "    learning: undefined,", // 读 app.learning.ok 会抛 TypeError
+    "    listen: function () {",
+    "      return new Promise(function (resolve) {",
+    "        const s = http.createServer(function (req, res) { res.end('still alive') })",
+    "        s.listen(0, '127.0.0.1', function () {",
+    "          console.log('PORT=' + s.address().port)",
+    "          resolve(s.address().port)",
+    "        })",
+    "      })",
+    "    },",
+    "  }",
+    "}",
+    "require(" + JSON.stringify(mainPath) + ").main()",
+  ].join("\n")
+  const child = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] })
+  let stdout = ""
+  let stderr = ""
+  child.stdout.on("data", function (chunk) {
+    stdout += chunk.toString()
+  })
+  child.stderr.on("data", function (chunk) {
+    stderr += chunk.toString()
+  })
+  try {
+    // 等假服务把端口号打出来
+    const port = await waitFor(function () {
+      const m = /PORT=(\d+)/.exec(stdout)
+      return m ? m[1] : null
+    })
+    assert.ok(port, "假服务没能启动起来，实际输出：\n" + stdout + stderr)
+    // 再等一会儿，让 .then 回调里的异常冒出来
+    await sleep(500)
+    assert.strictEqual(
+      child.exitCode,
+      null,
+      "listen 已经成功，服务不该被 process.exit(1) 杀掉，实际退出码：" + child.exitCode
+    )
+    assert.ok(
+      stderr.indexOf("无法监听端口") === -1,
+      "异常不是端口问题，不该说「无法监听端口」，实际输出：\n" + stderr
+    )
+    assert.ok(
+      stderr.indexOf("占用") === -1,
+      "异常不是端口问题，不该提端口占用，实际输出：\n" + stderr
+    )
+    assert.ok(stderr.indexOf("启动") !== -1, "应该打印中文提示，实际输出：\n" + stderr)
+    assert.ok(stderr.indexOf("TypeError") !== -1, "应该带上异常类型，实际输出：\n" + stderr)
+    // 服务还活着：说明异常没有把已经监听的服务器杀掉
+    const res = await fetch("http://127.0.0.1:" + port + "/")
+    assert.strictEqual(await res.text(), "still alive")
+  } finally {
+    child.kill()
+  }
+})
 ```
 
 Create `projects/apps/algo-plan/tests/harness.test.js`：
@@ -649,6 +842,13 @@ test("run-all.js 在没有测试套件时报错退出（退出码非 0）", func
     assert.ok(
       (res.stderr || "").indexOf("没有找到任何测试套件") !== -1,
       "应该打印中文提示，实际输出：" + JSON.stringify(res.stderr)
+    )
+    // 提示必须完整送到：stderr 是异步管道时，process.exit() 会在管道把数据
+    // 刷出去之前就把进程干掉，尾部会被截断。run-all.js 现在改用
+    // process.exitCode 让进程自然退出，所以尾部也必须在。
+    assert.ok(
+      (res.stderr || "").indexOf("请先创建测试文件") !== -1,
+      "中文提示的尾部不能被截断，实际输出：" + JSON.stringify(res.stderr)
     )
   } finally {
     sandbox.cleanup()
@@ -719,9 +919,6 @@ Create `projects/apps/algo-plan/server/router.js`：
 
 /** 请求体上限 1MB，防止本地误传超大 body 把内存吃满 */
 const MAX_BODY_BYTES = 1024 * 1024
-
-/** 超限后仍继续丢弃的字节上限：超过这个量就放弃收，直接断开连接 */
-const DRAIN_LIMIT_BYTES = MAX_BODY_BYTES * 8
 
 /** 带 HTTP 状态码的错误，供 handler 抛出 */
 class HttpError extends Error {
@@ -818,13 +1015,18 @@ function readJsonBody(req) {
     let chunks = []
     let settled = false
 
-    /** 超限后用来丢弃剩余数据的回调：只算字节数，不缓存 */
-    function onDrain(chunk) {
-      size += chunk.length
-      if (size > DRAIN_LIMIT_BYTES) {
-        // 病态大 body：读得够多了，直接断连接（此时 413 响应早已写完）
-        req.destroy()
-      }
+    /** 超限后用来丢弃剩余数据的回调：只丢不存，也绝不中途断连 */
+    function onDrain() {
+      // 故意空实现：这段数据直接丢掉，只为把 socket 里剩下的 body 读干净。
+      // 必须留一个 'data' 监听器：把 onData 摘掉之后光靠 resume() 不保证真的排空，
+      // 留着监听器才能保证数据被消费掉——socket 收空，连接收尾时才不会回 RST。
+      //
+      // 之前这里有个「读到 8MB 就 req.destroy()」的兜底，害得 10MB 的请求
+      // 客户端只拿到 ECONNRESET——销毁 socket 会让内核回 RST，
+      // 把 app.js 已经写好的 413 响应冲掉。
+      // 中途断连接对内存也毫无保护作用（chunks 已经清空，不再缓存任何东西），
+      // 只省带宽而已；而本服务只监听 127.0.0.1，没有远程对手方。
+      // 所以这里一路排空到 body 结束，让 413 响应能安稳送到客户端。
     }
 
     function onData(chunk) {
@@ -982,8 +1184,14 @@ function createServer(opts) {
           return found.route.handler(req, res, found.params, query)
         })
         .catch(function (err) {
-          // 响应已经开始发出、或连接已经断了：不能再改状态码，只能收尾
+          // 响应已经开始发出、或连接已经断了：不能再改状态码，只能收尾。
+          // 但异常不能就这么没了——下面那条 console.error 在这个分支里会被跳过，
+          // handler「先 res.end() 再 throw」就会彻底静默。所以这里也要留一份日志。
           if (res.headersSent || res.writableEnded || res.destroyed) {
+            console.error(
+              "[algo-plan] 接口 " + req.method + " " + rawPath + " 处理异常（响应已发出，无法再改状态码）：",
+              err
+            )
             if (!res.writableEnded && !res.destroyed) res.end()
             return
           }
@@ -1168,9 +1376,12 @@ function main() {
   checkNodeVersion()
   const app = createApp()
   const port = Number(process.env.PORT || 5173)
+  // listen 是否已经成功：用来区分「端口没起来」和「起来了但后面的启动输出炸了」
+  let listenOk = false
   app
     .listen(port)
     .then(function (p) {
+      listenOk = true
       console.log("算法能力计划 App 已启动：http://127.0.0.1:" + p)
       if (app.learning.ok) {
         console.log("learning 仓：" + app.learning.root)
@@ -1179,15 +1390,36 @@ function main() {
       }
     })
     .catch(function (err) {
-      // listen 失败（端口被占用等）：打中文错误再退出。
-      // 不接 catch 的话会变成未捕获 rejection，打印英文系统错误 + 堆栈，
-      // 跟这个文件里精心写的中文版本闸门不是一个风格。
       const code = err && err.code ? err.code : "未知错误"
-      console.error("启动失败：无法监听端口 " + port + "（" + code + "）")
+      if (listenOk) {
+        // listen 已经成功了：异常来自上面的 .then 回调（比如读 app.learning 时炸了），
+        // 跟端口一点关系都没有。这时候再 process.exit(1) 会把已经跑起来的服务杀掉，
+        // 所以只记日志，让服务继续跑。
+        console.error(
+          "[algo-plan] 启动信息输出失败（服务已在端口 " + port + " 上运行）：",
+          err
+        )
+        return
+      }
+      // listen 失败：最常见的是端口被占用，按错误码给不同的中文提示
+      if (code === "EADDRINUSE") {
+        console.error(
+          "启动失败：端口 " + port + " 已被占用（EADDRINUSE），请换一个端口，或先关掉占用该端口的程序"
+        )
+      } else if (code === "EACCES") {
+        console.error(
+          "启动失败：没有权限监听端口 " + port + "（EACCES），请换一个 1024 以上的端口"
+        )
+      } else {
+        console.error("启动失败：无法监听端口 " + port + "（" + code + "）")
+      }
       if (!err || !err.code) {
         // 没有错误码的意外异常才补一份堆栈，方便定位
         console.error(err)
       }
+      // 这里必须用 process.exit(1)：createApp() 已经打开了 SQLite 连接，
+      // 改成 process.exitCode = 1 的话进程会因为连接还挂着而不退出。
+      // stderr 是终端而不是管道时不会截断；真要管道场景再单独处理。
       process.exit(1)
     })
 }
@@ -1320,39 +1552,49 @@ fs.readdirSync(path.join(ROOT, "tests")).forEach(function (file) {
   if (/^.+\.test\.js$/.test(file)) suites.push(file)
 })
 
-if (suites.length === 0) {
-  // 空跑静默「通过」是最阴的一种假绿：一条断言都没跑，退出码却是 0
-  console.error("没有找到任何测试套件（tests/*.test.js），请先创建测试文件")
-  process.exit(1)
+function main() {
+  if (suites.length === 0) {
+    // 空跑静默「通过」是最阴的一种假绿：一条断言都没跑，退出码却是 0
+    // 这里用 process.exitCode 而不是 process.exit()：stderr 可能是异步管道，
+    // process.exit() 会在管道把数据刷出去之前就把进程干掉，中文提示可能被截断。
+    console.error("没有找到任何测试套件（tests/*.test.js），请先创建测试文件")
+    process.exitCode = 1
+    return
+  }
+
+  let failed = 0
+  suites.forEach(function (file) {
+    process.stdout.write("\n▶ " + file + "\n")
+    try {
+      const out = execFileSync(process.execPath, [path.join(ROOT, "tests", file)], {
+        cwd: ROOT,
+        encoding: "utf8",
+      })
+      const lines = out.trim().split("\n")
+      // 保留 node:test 的收尾统计。只留 3 行会把 "ℹ pass N / ℹ fail 0" 正好切掉，
+      // 看不出这套件到底跑了多少条断言
+      console.log(lines.slice(-5).join("\n"))
+      const counts = []
+      lines.forEach(function (line) {
+        const m = /^ℹ (tests|pass|fail)\s+(\d+)/.exec(line)
+        if (m) counts.push(m[1] + " " + m[2])
+      })
+      if (counts.length > 0) console.log("断言统计：" + counts.join(" / "))
+    } catch (e) {
+      failed += 1
+      const out = ((e.stdout || "") + (e.stderr || "")).trim()
+      console.log(out.split("\n").slice(-20).join("\n"))
+    }
+  })
+
+  console.log("\n" + (suites.length - failed) + " / " + suites.length + " 套件通过")
+  // 用 process.exitCode 而不是 process.exit()：stderr 是异步管道时，
+  // process.exit() 可能在管道把数据刷出去之前就把进程干掉，中文提示会被截断。
+  // 置了 exitCode 之后进程自然退出，stderr 能被 flush 干净；退出码照样非 0。
+  process.exitCode = failed === 0 ? 0 : 1
 }
 
-let failed = 0
-suites.forEach(function (file) {
-  process.stdout.write("\n▶ " + file + "\n")
-  try {
-    const out = execFileSync(process.execPath, [path.join(ROOT, "tests", file)], {
-      cwd: ROOT,
-      encoding: "utf8",
-    })
-    const lines = out.trim().split("\n")
-    // 保留 node:test 的收尾统计。只留 3 行会把 "ℹ pass N / ℹ fail 0" 正好切掉，
-    // 看不出这套件到底跑了多少条断言
-    console.log(lines.slice(-5).join("\n"))
-    const counts = []
-    lines.forEach(function (line) {
-      const m = /^ℹ (tests|pass|fail)\s+(\d+)/.exec(line)
-      if (m) counts.push(m[1] + " " + m[2])
-    })
-    if (counts.length > 0) console.log("断言统计：" + counts.join(" / "))
-  } catch (e) {
-    failed += 1
-    const out = ((e.stdout || "") + (e.stderr || "")).trim()
-    console.log(out.split("\n").slice(-20).join("\n"))
-  }
-})
-
-console.log("\n" + (suites.length - failed) + " / " + suites.length + " 套件通过")
-process.exit(failed === 0 ? 0 : 1)
+main()
 ```
 
 - [ ] **Step 9: 跑测试确认通过**
@@ -1361,7 +1603,7 @@ process.exit(failed === 0 ? 0 : 1)
 cd /c/code/StillEvolving/projects/apps/algo-plan && node tests/run-all.js
 ```
 
-Expected: `4 / 4 套件通过`，退出码 0
+Expected: `4 / 4 套件通过`，退出码 0（断言统计：errors 13 / harness 2 / router 10 / smoke 7，合计 32 条）
 
 - [ ] **Step 10: 提交并推送**
 
