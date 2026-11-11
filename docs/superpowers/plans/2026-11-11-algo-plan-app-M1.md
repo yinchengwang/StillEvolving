@@ -106,6 +106,8 @@ projects/apps/algo-plan/
 - Create: `projects/apps/algo-plan/tests/run-all.js`
 - Create: `projects/apps/algo-plan/tests/smoke.test.js`
 - Create: `projects/apps/algo-plan/tests/router.test.js`
+- Create: `projects/apps/algo-plan/tests/errors.test.js`
+- Create: `projects/apps/algo-plan/tests/harness.test.js`
 
 **Interfaces:**
 - Consumes: 无
@@ -115,6 +117,18 @@ projects/apps/algo-plan/
   - `server/app.js` 的 `createServer(opts)`：`opts.routes` 是 `[{method, pattern, handler}]`；handler 签名 `handler(req, res, params, query)`，`query` 是 `URLSearchParams`
   - `server/main.js` 导出 `main()`、`checkNodeVersion()`
 
+> **Task 1 评审修复（2026-11-11）**：本 Task 的代码块已按 M1 Task 1 代码评审的意见修订，
+> 重跑本计划请直接用下面的代码块（代码块与 `apps/algo-plan/` 下的实现逐字一致）。修订点：
+>
+> - `server/router.js`：`readJsonBody` 超限时**不再** `req.destroy()`——销毁 socket 会让 413 响应写不出去，
+>   客户端只看到连接重置；改成暂停读取、把剩余 body 读干净丢弃，走正常的 413 响应路径；
+>   解析结果不是 JSON 对象（数字/字符串/null/数组）时报 400。
+> - `server/app.js`：只有 `HttpError` 自己的中文文案才透传给浏览器，其余异常统一回「服务端出错」
+>   并在服务端 `console.error` 打完整堆栈；静态分支加 try/catch（读失败按错误类型分流 404/500）；
+>   listen 成功后撤掉一次性的 error 监听器并装常驻的中文日志处理器；`/api` 前缀判定统一成 `isApiPath` helper。
+> - `server/main.js`：`app.listen()` 补 `.catch`，启动失败打中文错误并 `process.exit(1)`。
+> - `tests/run-all.js`：输出里保留 node:test 的断言计数；没有测试套件时报错退出，不再空跑静默通过。
+> - 新增 `tests/errors.test.js` 与 `tests/harness.test.js`，覆盖上面这些错误路径。
 - [ ] **Step 1: 写失败的冒烟测试**
 
 Create `projects/apps/algo-plan/tests/smoke.test.js`：
@@ -196,6 +210,18 @@ test("静态资源根目录指向 web/", function () {
   const { WEB_DIR } = require("../server/app.js")
   assert.strictEqual(path.basename(WEB_DIR), "web")
 })
+
+test("静态资源带查询串仍能正常返回", async function () {
+  const app = createServer({ routes: [] })
+  const port = await app.listen(0)
+  try {
+    const res = await fetch("http://127.0.0.1:" + port + "/style.css?v=1")
+    assert.strictEqual(res.status, 200)
+    assert.strictEqual(res.headers.get("content-type"), "text/css; charset=utf-8")
+  } finally {
+    await app.close()
+  }
+})
 ```
 
 Create `projects/apps/algo-plan/tests/router.test.js`：
@@ -210,7 +236,7 @@ const test = require("node:test")
 const assert = require("node:assert")
 const { Readable } = require("node:stream")
 
-const { compile, createRouter, readJsonBody } = require("../server/router.js")
+const { compile, createRouter, readJsonBody, MAX_BODY_BYTES } = require("../server/router.js")
 
 /** 造一个假的 IncomingMessage */
 function fakeReq(text) {
@@ -269,15 +295,394 @@ test("readJsonBody 非法 JSON 报 400", async function () {
     }
   )
 })
+
+test("readJsonBody 请求体超限报 413", async function () {
+  const big = "x".repeat(MAX_BODY_BYTES + 1)
+  await assert.rejects(
+    function () {
+      return readJsonBody(fakeReq(big))
+    },
+    function (err) {
+      return err.status === 413
+    }
+  )
+})
+
+test("readJsonBody 解析结果不是对象时报 400", async function () {
+  // 数字、字符串、null、数组都不是 JSON 对象；当成空对象会把
+  // 「客户端 body 传错了」变成「服务端字段缺失」，所以直接报 400
+  const notObjects = ["123", '"abc"', "null", "[1,2]"]
+  for (const raw of notObjects) {
+    await assert.rejects(
+      function () {
+        return readJsonBody(fakeReq(raw))
+      },
+      function (err) {
+        return err.status === 400
+      },
+      "body 为 " + raw + " 时应报 400"
+    )
+  }
+})
+```
+
+Create `projects/apps/algo-plan/tests/errors.test.js`：
+
+```javascript
+"use strict"
+/**
+ * errors.test.js —— 错误路径：请求体超限、异常兜底、状态码透传
+ *
+ * 这些都是「只有出错时才走」的分支，最容易因为没测而悄悄坏掉。
+ */
+
+const test = require("node:test")
+const assert = require("node:assert")
+const path = require("node:path")
+const { spawnSync } = require("node:child_process")
+
+const { createServer } = require("../server/app.js")
+const { HttpError, MAX_BODY_BYTES, readJsonBody } = require("../server/router.js")
+
+/** 起一个服务，跑一段逻辑，最后一定关掉 */
+async function withServer(routes, fn) {
+  const app = createServer({ routes: routes })
+  const port = await app.listen(0)
+  try {
+    return await fn(port)
+  } finally {
+    await app.close()
+  }
+}
+
+/** 临时接管 console.error，把服务端日志抓下来 */
+function captureConsoleError() {
+  const original = console.error
+  const lines = []
+  console.error = function () {
+    const args = Array.prototype.slice.call(arguments)
+    lines.push(
+      args
+        .map(function (arg) {
+          return arg instanceof Error ? arg.stack : String(arg)
+        })
+        .join("\n")
+    )
+  }
+  return {
+    lines: lines,
+    restore: function () {
+      console.error = original
+    },
+  }
+}
+
+test("请求体超过 1MB 时客户端收到 413 与中文 JSON", async function () {
+  await withServer(
+    [
+      {
+        method: "POST",
+        pattern: "/api/echo",
+        handler: async function (req, res) {
+          await readJsonBody(req)
+          res.end("ok")
+        },
+      },
+    ],
+    async function (port) {
+      const big = "x".repeat(MAX_BODY_BYTES + 1024)
+      const res = await fetch("http://127.0.0.1:" + port + "/api/echo", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: big,
+        signal: AbortSignal.timeout(15000),
+      })
+      assert.strictEqual(res.status, 413)
+      const body = await res.json()
+      assert.strictEqual(body.error, "请求体过大（上限 1MB）")
+    }
+  )
+})
+
+test("handler 抛非 HttpError 时返回 500 中文文案", async function () {
+  // 这里顺手把服务端日志接住，免得测试输出里混进一坨堆栈
+  const capture = captureConsoleError()
+  try {
+    await withServer(
+      [
+        {
+          method: "GET",
+          pattern: "/api/boom",
+          handler: function () {
+            throw new TypeError("Cannot read properties of undefined (reading 'id')")
+          },
+        },
+      ],
+      async function (port) {
+        const res = await fetch("http://127.0.0.1:" + port + "/api/boom")
+        assert.strictEqual(res.status, 500)
+        const body = await res.json()
+        assert.strictEqual(body.error, "服务端出错")
+        assert.strictEqual(body.error.indexOf("Cannot read"), -1, "不应把英文原始报错透给浏览器")
+      }
+    )
+  } finally {
+    capture.restore()
+  }
+})
+
+test("handler 抛非 HttpError 时服务端留下完整堆栈日志", async function () {
+  const capture = captureConsoleError()
+  try {
+    await withServer(
+      [
+        {
+          method: "GET",
+          pattern: "/api/boom",
+          handler: function () {
+            throw new TypeError("Cannot read properties of undefined (reading 'id')")
+          },
+        },
+      ],
+      async function (port) {
+        const res = await fetch("http://127.0.0.1:" + port + "/api/boom")
+        assert.strictEqual(res.status, 500)
+      }
+    )
+    assert.ok(capture.lines.length > 0, "服务端应该打日志，不能把异常静默吞掉")
+    const text = capture.lines.join("\n")
+    assert.ok(text.indexOf("TypeError") !== -1, "日志里应有异常类型")
+    assert.ok(text.indexOf("Cannot read properties") !== -1, "日志里应有异常信息")
+    assert.ok(text.indexOf("at ") !== -1, "日志里应有调用堆栈")
+  } finally {
+    capture.restore()
+  }
+})
+
+test("HttpError 的 status 透传到 HTTP 响应状态码", async function () {
+  await withServer(
+    [
+      {
+        method: "GET",
+        pattern: "/api/missing",
+        handler: function () {
+          throw new HttpError(404, "题目不存在")
+        },
+      },
+      {
+        method: "GET",
+        pattern: "/api/teapot",
+        handler: function () {
+          throw new HttpError(418, "我是茶壶")
+        },
+      },
+    ],
+    async function (port) {
+      const res404 = await fetch("http://127.0.0.1:" + port + "/api/missing")
+      assert.strictEqual(res404.status, 404)
+      const body404 = await res404.json()
+      assert.strictEqual(body404.error, "题目不存在")
+
+      const res418 = await fetch("http://127.0.0.1:" + port + "/api/teapot")
+      assert.strictEqual(res418.status, 418)
+      const body418 = await res418.json()
+      assert.strictEqual(body418.error, "我是茶壶")
+    }
+  )
+})
+
+test("handler 收到的 query 是 URLSearchParams 实例", async function () {
+  let received = null
+  await withServer(
+    [
+      {
+        method: "GET",
+        pattern: "/api/query",
+        handler: function (req, res, params, query) {
+          received = query
+          res.end("ok")
+        },
+      },
+    ],
+    async function (port) {
+      const res = await fetch("http://127.0.0.1:" + port + "/api/query?a=1&b=%E4%B8%AD")
+      assert.strictEqual(res.status, 200)
+      assert.ok(received instanceof URLSearchParams, "query 应该是 URLSearchParams 实例")
+      assert.strictEqual(received.get("a"), "1")
+      assert.strictEqual(received.get("b"), "中")
+    }
+  )
+})
+
+test("/api（不带尾斜杠）返回与 /api/nope 一致的 JSON 404", async function () {
+  await withServer([], async function (port) {
+    const res = await fetch("http://127.0.0.1:" + port + "/api")
+    assert.strictEqual(res.status, 404)
+    assert.strictEqual(res.headers.get("content-type"), "application/json; charset=utf-8")
+    const body = await res.json()
+    assert.strictEqual(body.error, "接口不存在")
+  })
+})
+
+test("静态文件读失败时按错误类型分流（EPERM 走 500，服务不挂）", async function () {
+  const fs = require("node:fs")
+  const original = fs.readFileSync
+  const capture = captureConsoleError()
+  try {
+    // 模拟 Windows 上文件被独占锁定：readFileSync 抛 EPERM
+    fs.readFileSync = function (file) {
+      if (String(file).indexOf("style.css") !== -1) {
+        const err = new Error("EPERM: operation not permitted, open '" + file + "'")
+        err.code = "EPERM"
+        throw err
+      }
+      return original.apply(fs, arguments)
+    }
+    await withServer([], async function (port) {
+      const res = await fetch("http://127.0.0.1:" + port + "/style.css")
+      assert.strictEqual(res.status, 500)
+      assert.ok((await res.text()).indexOf("500") !== -1)
+      // 服务还活着：再请求一次首页
+      const ok = await fetch("http://127.0.0.1:" + port + "/")
+      assert.strictEqual(ok.status, 200)
+    })
+  } finally {
+    fs.readFileSync = original
+    capture.restore()
+  }
+})
+
+test("listen 成功后运行期错误只记日志，不会变成未捕获异常", async function () {
+  const capture = captureConsoleError()
+  try {
+    const app = createServer({ routes: [] })
+    const port = await app.listen(0)
+    try {
+      // 旧实现：第一次 error 被已 settle 的 reject 吞掉（无日志），
+      // 第二次 error 就没监听器了 → 未捕获异常，整个进程挂掉
+      app.server.emit("error", new Error("模拟第一次错误"))
+      app.server.emit("error", new Error("模拟第二次错误"))
+      assert.strictEqual(capture.lines.length, 2, "两次运行期错误都应该留下中文日志")
+      assert.ok(capture.lines.join("\n").indexOf("服务运行期错误") !== -1)
+    } finally {
+      await app.close()
+    }
+  } finally {
+    capture.restore()
+  }
+})
+
+test("main.js 启动失败时打印中文错误并以退出码 1 退出", function () {
+  // createApp 要到 Task 6 才落地，这里把 app.js 的导出换成假的 listen，
+  // 用子进程跑 main()，验证端口被占用这类失败不会变成未捕获 rejection
+  const appPath = path.join(__dirname, "..", "server", "app.js")
+  const mainPath = path.join(__dirname, "..", "server", "main.js")
+  const script = [
+    "const appModule = require(" + JSON.stringify(appPath) + ")",
+    "appModule.createApp = function () {",
+    "  return {",
+    "    learning: { ok: false, reason: '测试' },",
+    "    listen: function () {",
+    "      const err = new Error('listen EADDRINUSE 127.0.0.1:5173')",
+    "      err.code = 'EADDRINUSE'",
+    "      return Promise.reject(err)",
+    "    },",
+    "  }",
+    "}",
+    "require(" + JSON.stringify(mainPath) + ").main()",
+  ].join("\n")
+  const res = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" })
+  assert.strictEqual(res.status, 1, "启动失败时应以退出码 1 退出，实际输出：\n" + res.stderr)
+  assert.ok(
+    (res.stderr || "").indexOf("启动失败") !== -1,
+    "应该打印中文提示，实际输出：\n" + res.stderr
+  )
+  assert.ok(
+    (res.stderr || "").indexOf("EADDRINUSE") !== -1,
+    "应该带上错误码，实际输出：\n" + res.stderr
+  )
+})
+```
+
+Create `projects/apps/algo-plan/tests/harness.test.js`：
+
+```javascript
+"use strict"
+/**
+ * harness.test.js —— 测试入口自检：run-all.js 自己别出岔子
+ *
+ * run-all.js 是「跑测试的测试」，它要是空跑还退出 0，
+ * 整套回归就等于没有。这里把它复制到临时目录里单独跑。
+ */
+
+const test = require("node:test")
+const assert = require("node:assert")
+const fs = require("node:fs")
+const os = require("node:os")
+const path = require("node:path")
+const { execFileSync, spawnSync } = require("node:child_process")
+
+const RUN_ALL = path.join(__dirname, "run-all.js")
+
+/** 建一个临时目录，把 run-all.js 复制进去，模拟「另一个工程」 */
+function makeSandbox() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "algo-plan-harness-"))
+  const testsDir = path.join(dir, "tests")
+  fs.mkdirSync(testsDir)
+  fs.copyFileSync(RUN_ALL, path.join(testsDir, "run-all.js"))
+  return {
+    dir: dir,
+    testsDir: testsDir,
+    cleanup: function () {
+      fs.rmSync(dir, { recursive: true, force: true })
+    },
+  }
+}
+
+test("run-all.js 在没有测试套件时报错退出（退出码非 0）", function () {
+  const sandbox = makeSandbox()
+  try {
+    const res = spawnSync(process.execPath, [path.join(sandbox.testsDir, "run-all.js")], {
+      encoding: "utf8",
+    })
+    assert.notStrictEqual(res.status, 0, "空套件时退出码必须非 0，不能静默通过")
+    assert.ok(
+      (res.stderr || "").indexOf("没有找到任何测试套件") !== -1,
+      "应该打印中文提示，实际输出：" + JSON.stringify(res.stderr)
+    )
+  } finally {
+    sandbox.cleanup()
+  }
+})
+
+test("run-all.js 的输出里能看到断言通过数", function () {
+  const sandbox = makeSandbox()
+  try {
+    fs.writeFileSync(
+      path.join(sandbox.testsDir, "fake.test.js"),
+      'const test = require("node:test")\ntest("占位断言", function () {})\n',
+      "utf8"
+    )
+    const out = execFileSync(process.execPath, [path.join(sandbox.testsDir, "run-all.js")], {
+      encoding: "utf8",
+    })
+    assert.ok(out.indexOf("pass 1") !== -1, "输出里应能看到 pass 计数，实际输出：\n" + out)
+    assert.ok(out.indexOf("1 / 1 套件通过") !== -1, "输出里应能看到套件通过数，实际输出：\n" + out)
+  } finally {
+    sandbox.cleanup()
+  }
+})
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd /c/code/StillEvolving/projects/apps/algo-plan && node tests/run-all.js
+cd /c/code/StillEvolving/projects/apps/algo-plan && node tests/smoke.test.js
 ```
 
 Expected: FAIL，错误信息含 `Cannot find module '../server/app.js'`
+
+> `tests/run-all.js` 要到 Step 8 才创建，这一步直接跑测试文件即可；Step 9 再用 `run-all.js` 跑全量。
 
 - [ ] **Step 3: 创建 package.json**
 
@@ -314,6 +719,9 @@ Create `projects/apps/algo-plan/server/router.js`：
 
 /** 请求体上限 1MB，防止本地误传超大 body 把内存吃满 */
 const MAX_BODY_BYTES = 1024 * 1024
+
+/** 超限后仍继续丢弃的字节上限：超过这个量就放弃收，直接断开连接 */
+const DRAIN_LIMIT_BYTES = MAX_BODY_BYTES * 8
 
 /** 带 HTTP 状态码的错误，供 handler 抛出 */
 class HttpError extends Error {
@@ -396,36 +804,77 @@ function createRouter() {
 }
 
 /**
- * 读请求体并解析成 JSON。空 body 返回 {}，非法 JSON 抛 HttpError(400)。
+ * 读请求体并解析成 JSON。
+ * - 空 body 返回 {}
+ * - 非法 JSON 抛 HttpError(400)
+ * - body 超过 1MB 抛 HttpError(413)
+ * - body 解析出来不是 JSON 对象（数字/字符串/null/数组）抛 HttpError(400)
  * @param {import("node:http").IncomingMessage} req
- * @returns {Promise<object>}
+ * @returns {Promise<object>} 恒定 resolve 一个 JSON 对象
  */
 function readJsonBody(req) {
   return new Promise(function (resolve, reject) {
     let size = 0
-    const chunks = []
-    req.on("data", function (chunk) {
+    let chunks = []
+    let settled = false
+
+    /** 超限后用来丢弃剩余数据的回调：只算字节数，不缓存 */
+    function onDrain(chunk) {
+      size += chunk.length
+      if (size > DRAIN_LIMIT_BYTES) {
+        // 病态大 body：读得够多了，直接断连接（此时 413 响应早已写完）
+        req.destroy()
+      }
+    }
+
+    function onData(chunk) {
       size += chunk.length
       if (size > MAX_BODY_BYTES) {
+        // 超限：只 reject，**不要** req.destroy()。
+        // 销毁 socket 之后 app.js 的 413 响应就写不出去了，
+        // 客户端只会收到连接重置（UND_ERR_SOCKET），看不到这句中文提示。
+        settled = true
+        chunks = []
+        req.removeListener("data", onData)
+        // 把剩下的 body 读干净并丢弃：socket 收空，连接收尾时才不会回 RST 把 413 响应打掉
+        req.on("data", onDrain)
+        req.resume()
         reject(new HttpError(413, "请求体过大（上限 1MB）"))
-        req.destroy()
         return
       }
       chunks.push(chunk)
-    })
+    }
+
+    req.on("data", onData)
     req.on("end", function () {
+      if (settled) return
+      settled = true
       const raw = Buffer.concat(chunks).toString("utf8").trim()
       if (raw === "") {
         resolve({})
         return
       }
+      let value
       try {
-        resolve(JSON.parse(raw))
+        value = JSON.parse(raw)
       } catch (e) {
         reject(new HttpError(400, "请求体不是合法 JSON"))
+        return
       }
+      // 只接受 JSON 对象：数字、字符串、null、数组都不是对象。
+      // 悄悄当成空对象会把「客户端 body 传错了」变成「服务端字段缺失」，更难排查，
+      // 所以直接报 400，让调用方明确知道 body 的形状不对。
+      if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        reject(new HttpError(400, "请求体必须是 JSON 对象"))
+        return
+      }
+      resolve(value)
     })
-    req.on("error", reject)
+    req.on("error", function (err) {
+      if (settled) return
+      settled = true
+      reject(err)
+    })
   })
 }
 
@@ -454,7 +903,7 @@ const http = require("node:http")
 const fs = require("node:fs")
 const path = require("node:path")
 
-const { createRouter } = require("./router.js")
+const { createRouter, HttpError } = require("./router.js")
 
 const ROOT = path.resolve(__dirname, "..")
 const WEB_DIR = path.join(ROOT, "web")
@@ -482,12 +931,22 @@ function sendJson(res, status, body) {
 }
 
 /**
+ * API 请求前缀判定：/api 与 /api/... 都算 API 请求。
+ * 统一成一个 helper，免得 /api 漏到静态分支去回 text/plain 的 404，
+ * 跟 /api/nope 的 JSON 404 对不上。
+ */
+function isApiPath(urlPath) {
+  return urlPath === "/api" || urlPath.indexOf("/api/") === 0
+}
+
+/**
  * 把 URL 路径映射到 web/ 内的文件；越界或编码非法一律拒绝（返回 null）。
+ * 入参是已经切掉查询串的路径。
  */
 function resolveStatic(urlPath) {
   let clean
   try {
-    clean = decodeURIComponent(urlPath.split("?")[0])
+    clean = decodeURIComponent(urlPath)
   } catch (e) {
     return null
   }
@@ -505,6 +964,8 @@ function createServer(opts) {
   const options = opts || {}
   const router = createRouter()
   const routes = options.routes || []
+  /** 常驻的 server 错误监听器只装一次，避免 listen 被调多次时重复挂 */
+  let runtimeErrorHandled = false
   routes.forEach(function (route) {
     router.add(route.method, route.pattern, route.handler)
   })
@@ -521,13 +982,22 @@ function createServer(opts) {
           return found.route.handler(req, res, found.params, query)
         })
         .catch(function (err) {
-          if (res.headersSent) {
-            res.end()
+          // 响应已经开始发出、或连接已经断了：不能再改状态码，只能收尾
+          if (res.headersSent || res.writableEnded || res.destroyed) {
+            if (!res.writableEnded && !res.destroyed) res.end()
             return
           }
-          const status = err && err.status ? err.status : 500
+          // 只有 HttpError 的文案是「我们自己写的中文」，可以直接透给浏览器；
+          // 其它异常（TypeError 之类）是原生英文报错，透出去既看不懂也暴露实现细节
+          const isHttpError = err instanceof HttpError
+          // 只认 4xx/5xx：非法状态码会让 res.writeHead 抛错，反而把服务带崩
+          const status = isHttpError && err.status >= 400 && err.status <= 599 ? err.status : 500
+          if (!isHttpError) {
+            // 服务端留一份完整堆栈，不然异常在终端里毫无痕迹
+            console.error("[algo-plan] 接口 " + req.method + " " + rawPath + " 处理异常：", err)
+          }
           sendJson(res, status, {
-            error: (err && err.message) || "服务端出错",
+            error: isHttpError ? err.message : "服务端出错",
           })
         })
       return
@@ -542,7 +1012,7 @@ function createServer(opts) {
       return
     }
 
-    if (rawPath.indexOf("/api/") === 0) {
+    if (isApiPath(rawPath)) {
       sendJson(res, 404, { error: "接口不存在", path: rawPath })
       return
     }
@@ -553,12 +1023,28 @@ function createServer(opts) {
       res.end("400 非法路径")
       return
     }
-    if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
-      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" })
-      res.end("404 找不到")
+    let body
+    try {
+      if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
+        res.writeHead(404, { "content-type": "text/plain; charset=utf-8" })
+        res.end("404 找不到")
+        return
+      }
+      body = fs.readFileSync(file)
+    } catch (err) {
+      // Windows 上文件被独占锁定（EPERM/EBUSY）时 statSync/readFileSync 会抛错。
+      // 不兜住的话异常会从请求回调逃出去，Node 没有 uncaughtException 处理，整个服务挂掉。
+      const code = err && err.code ? err.code : "未知错误"
+      console.error("[algo-plan] 读取静态文件失败：" + file + "（" + code + "）")
+      if (code === "ENOENT" || code === "ENOTDIR") {
+        res.writeHead(404, { "content-type": "text/plain; charset=utf-8" })
+        res.end("404 找不到")
+        return
+      }
+      res.writeHead(500, { "content-type": "text/plain; charset=utf-8" })
+      res.end("500 服务器内部错误")
       return
     }
-    const body = fs.readFileSync(file)
     res.writeHead(200, {
       "content-type": MIME[path.extname(file)] || "application/octet-stream",
       "content-length": body.length,
@@ -571,8 +1057,24 @@ function createServer(opts) {
     server: server,
     listen: function (port) {
       return new Promise(function (resolve, reject) {
-        server.once("error", reject)
+        function onListenError(err) {
+          reject(err)
+        }
+        server.once("error", onListenError)
         server.listen(port, "127.0.0.1", function () {
+          // listen 成功后撤掉这个一次性监听器：它留在 server 上就是空转，
+          // 第一次 error 被已经 settle 的 reject 吞掉，第二次 error 就没人接（未捕获异常）。
+          server.removeListener("error", onListenError)
+          if (!runtimeErrorHandled) {
+            runtimeErrorHandled = true
+            // 常驻错误处理器：服务运行期的 socket 错误只记中文日志，不让进程崩掉
+            server.on("error", function (err) {
+              console.error(
+                "[algo-plan] 服务运行期错误：" + (err && err.code ? err.code : "未知错误"),
+                err
+              )
+            })
+          }
           resolve(server.address().port)
         })
       })
@@ -666,14 +1168,28 @@ function main() {
   checkNodeVersion()
   const app = createApp()
   const port = Number(process.env.PORT || 5173)
-  app.listen(port).then(function (p) {
-    console.log("算法能力计划 App 已启动：http://127.0.0.1:" + p)
-    if (app.learning.ok) {
-      console.log("learning 仓：" + app.learning.root)
-    } else {
-      console.log("未连接 learning 仓（纯本地模式）：" + app.learning.reason)
-    }
-  })
+  app
+    .listen(port)
+    .then(function (p) {
+      console.log("算法能力计划 App 已启动：http://127.0.0.1:" + p)
+      if (app.learning.ok) {
+        console.log("learning 仓：" + app.learning.root)
+      } else {
+        console.log("未连接 learning 仓（纯本地模式）：" + app.learning.reason)
+      }
+    })
+    .catch(function (err) {
+      // listen 失败（端口被占用等）：打中文错误再退出。
+      // 不接 catch 的话会变成未捕获 rejection，打印英文系统错误 + 堆栈，
+      // 跟这个文件里精心写的中文版本闸门不是一个风格。
+      const code = err && err.code ? err.code : "未知错误"
+      console.error("启动失败：无法监听端口 " + port + "（" + code + "）")
+      if (!err || !err.code) {
+        // 没有错误码的意外异常才补一份堆栈，方便定位
+        console.error(err)
+      }
+      process.exit(1)
+    })
 }
 
 if (require.main === module) {
@@ -804,6 +1320,12 @@ fs.readdirSync(path.join(ROOT, "tests")).forEach(function (file) {
   if (/^.+\.test\.js$/.test(file)) suites.push(file)
 })
 
+if (suites.length === 0) {
+  // 空跑静默「通过」是最阴的一种假绿：一条断言都没跑，退出码却是 0
+  console.error("没有找到任何测试套件（tests/*.test.js），请先创建测试文件")
+  process.exit(1)
+}
+
 let failed = 0
 suites.forEach(function (file) {
   process.stdout.write("\n▶ " + file + "\n")
@@ -813,7 +1335,15 @@ suites.forEach(function (file) {
       encoding: "utf8",
     })
     const lines = out.trim().split("\n")
-    console.log(lines.slice(-3).join("\n"))
+    // 保留 node:test 的收尾统计。只留 3 行会把 "ℹ pass N / ℹ fail 0" 正好切掉，
+    // 看不出这套件到底跑了多少条断言
+    console.log(lines.slice(-5).join("\n"))
+    const counts = []
+    lines.forEach(function (line) {
+      const m = /^ℹ (tests|pass|fail)\s+(\d+)/.exec(line)
+      if (m) counts.push(m[1] + " " + m[2])
+    })
+    if (counts.length > 0) console.log("断言统计：" + counts.join(" / "))
   } catch (e) {
     failed += 1
     const out = ((e.stdout || "") + (e.stderr || "")).trim()
@@ -831,7 +1361,7 @@ process.exit(failed === 0 ? 0 : 1)
 cd /c/code/StillEvolving/projects/apps/algo-plan && node tests/run-all.js
 ```
 
-Expected: `2 / 2 套件通过`，退出码 0
+Expected: `4 / 4 套件通过`，退出码 0
 
 - [ ] **Step 10: 提交并推送**
 
