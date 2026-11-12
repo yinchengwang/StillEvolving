@@ -378,3 +378,71 @@ M1 的 **G1–G16 全部继续生效**（零 npm 依赖、零构建、Node ≥ 2
 7. **不许编事实**：涉及 learning 仓与 projects 仓的真实数据（死脚本结构、轮次文件列名、题解目录、
    `g++` / `python` 版本、`.gitignore` 规则），动手前必须读实际文件确认；读不出来就在计划里写明
    「按 X 处理」的处理规则，而不是编一个数。
+
+---
+
+## 8. 补全轮追加：两套题库根与 Codeforces 题源
+
+> 日期：2026-11-12
+> 背景：M1–M3 完成后补了题库（用户反馈「没有跳原题的链接」「还缺俄罗斯竞赛的题」）。
+> 本节记录这轮改动对**既有签名**的增量，M5/M6 直接继承，不再另起炉灶。
+
+### 8.1 两套题库根
+
+```js
+// core/paths.js（新增，不改 resolveLearningRoot / bankDir 的语义）
+localBankDir(env, override?) -> string
+//   env.ALGO_PLAN_LOCAL_BANK 有值就用它（相对路径按 cwd 解析）；
+//   没有值就用工程仓内置的 <app>/bank。
+```
+
+```js
+// core/bank/provider.js（构造函数放宽，list/get/put 语义不变）
+new FileProvider(bankDir | string[] | null)
+//   给数组时按数组顺序建索引：同一个 id 出现在多个根里，**先出现的赢**，
+//   并往 index.warnings 里记一笔重复 id。
+//   读取（get/list）看到的是合并后的去重结果；
+//   写入（put）永远落在**第一个根**（人审库优先）。
+```
+
+`server/app.js` 的装配顺序固定为：
+
+```js
+const bankRoots = []
+if (learning.ok) bankRoots.push(path.join(learning.root, "bank"))   // 1. 人审题库
+if (options.localBank !== null) bankRoots.push(localBankDir(env, options.localBank))  // 2. 工程仓内置
+const provider = new FileProvider(bankRoots)
+```
+
+- `options.localBank === null` 表示**显式关掉内置题库**（测试隔离用）。
+- 工程仓内置题库住在 `apps/algo-plan/bank/`，**不能放 `data/`**——
+  `projects/.gitignore` 有 `data/` 规则，放那儿进不了 git。
+
+### 8.2 Codeforces 题源
+
+- 题目来源：Codeforces（`source: codeforces`），题号带字母（如 `cf-33-b`）。
+- **测试数据不公开**，所以用例**只提取题面里的样例**（官方给的输入输出）。
+- 题面结构：中文题意（人工整理）→ 英文原题面 → 输入输出 → 限制 → 样例 → 「题目信息」。
+- 每题带 `url`（去原题）与 `search_url`（源站搜索）两个字段。
+
+### 8.3 新增工具
+
+| 工具 | 作用 |
+|---|---|
+| `tools/import-codeforces.js` | 抓 CF 题面 → 写到**工程仓** `bank/<track>/`。CLI：`--dry-run` / `--rewrite` / `--bank <dir>` |
+| `tools/sync-links.js` | 给存量题回填 `url` / `search_url` |
+| `tools/fetch-cf-pages.js` | Chrome DevTools Protocol 抓 CF 题面页（网页版挂在 Cloudflare 后面，`/api/*` 放行） |
+
+导入器**绝不**碰 learning 仓的 git（同 G19/G20 精神）：只写文件，不 commit、不 push。
+
+### 8.4 接口字段增量
+
+在 §0 的既有接口上**加字段**，不改旧字段：
+
+| 接口 | 新增字段 |
+|---|---|
+| `GET /api/health` | `bank.roots: string[]`（当前生效的题库根，按优先级） |
+| `GET /api/problem/:id` | `sourceId: string`、`url: string`、`searchUrl: string` |
+
+`GET /api/bank` 的摘要项（`toSummary`）也带上 `url` / `searchUrl`，
+前端据此给出「去原题」/「去源站搜索」——两个都没有就明说没有，不装死链。
