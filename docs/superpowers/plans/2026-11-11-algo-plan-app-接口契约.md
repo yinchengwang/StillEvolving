@@ -260,6 +260,13 @@ assertCleanWorktree(repoRoot) -> {ok, dirtyFiles}
 | 接口 | 响应 |
 |---|---|
 | `GET /api/next` | `{action: {kind, problemId, title, estimatedMinutes, reason, reviewQueueLength} \| null, reviewQueueLength}` |
+
+> **`GET /api/next` 的补充字段**（M4 收尾时实测真实 learning 仓后追加）：
+> 轮次分支的动作额外带 `roundId` 与 `itemId`（字符串，别的分支为空串）。
+> 原因：真实轮次里混着**不在算法题库里**的卡片（Python 工具链、设计模式……），
+> 这类卡片的 `problemId` 为 `null`——推一个打不开题面的题目不算「下一个动作」。
+> 前端拿到 `problemId` 为空但有 `roundId` 时，应该把用户带到**轮次页**去勾掉那张卡片，
+> 而不是跳去空的作答页。
 | `POST /api/review/:id/grade` | 入参 `{quality}`；响应 `{problemId, nextReviewAt, intervalDays, easiness, lapses}` |
 | `GET /api/rounds` | `{rounds: [{id, file, title, goal, status, items:[...]}], warnings: []}` |
 | `PATCH /api/rounds/:id/items/:itemId` | 入参 `{status, doneDate, commitSha}`；响应 `{diff, warnings}` |
