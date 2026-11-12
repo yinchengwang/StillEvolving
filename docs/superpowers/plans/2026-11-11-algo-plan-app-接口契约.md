@@ -536,3 +536,162 @@ M5 的路由放在 `server/api-insights.js`（导出 `buildInsightRoutes(ctx)`�
 在 `server/app.js` 里**合并**进 `server/api.js` 的同一张路由表。
 **M5 完全不改 `server/api.js`**——M3 整体替换过它、M4 替换过整个 `buildRoutes`，
 再来一次整体覆盖就会把 `POST /api/attempt` 和 M4 的五条接口一起删掉。
+
+---
+
+## 10. M6 落地后的契约增量
+
+> 日期：2026-11-12
+> M6 实现完成后，把 §5 补成实际落地的形状（**加字段，不改旧字段**）。
+
+### 10.1 文件与导出
+
+```
+core/llm/prompts.js    提示词构造与响应解析（纯函数）
+core/llm/client.js     ArkClient / AnthropicClient / NullClient
+core/llm/guard.js      成本护栏（单次会话上限 + 每日上限）
+core/llm/service.js    服务层：串起 client + guard + prompts
+server/api-llm.js      M6 的七个路由
+tools/llm-check.js     离线自检（只读、不联网）
+web/llm.js             LLM 工作台（前端，**app.js 一个字没改**）
+```
+
+```js
+// core/llm/prompts.js
+buildPrompt(kind, context) -> {system, user}
+  // kind ∈ KINDS = ["explain", "hint", "grade-idea", "generate", "fill"]
+  // 纯函数：不联网、不读环境变量、不读文件、不取时间。
+  // 同样的输入必须构造出同样的提示词（tools/llm-check.js 对五个 kind 做指纹自检）。
+parseResponse(text, kind) -> {ok: true, ...} | {ok: false, reason: string}
+EXPLAIN_LEVELS = ["思路", "代码"]
+HINT_LEVELS    = ["方向", "思路", "伪码", "代码"]
+
+// core/llm/client.js
+createLlmClient({provider?, apiKey?, baseUrl?, model?, env?, fetchImpl?, enabled?}) -> client
+  client.complete({system, user, temperature?}) -> Promise<string>
+  client.name  -> "ark" | "anthropic" | "null"
+  client.model -> string
+  client.reason -> string   // 只在 null 客户端上有
+keySourceOf(provider, env) -> string   // 只报变量名，**绝不回显密钥**
+
+// core/llm/guard.js
+checkAll(store, sessionId, date)   -> {ok, message, ...}   // 会话与每日两档一起查
+consumeAll(store, sessionId, date) -> void                // 两档一起计数
+limits(store) -> {sessionLimit, dailyLimit}
+sessionKey(sessionId) -> "llm.quota.session.<id>"
+dailyKey(date)         -> "llm.quota.daily.<YYYY-MM-DD>"
+seedLimits(store, env) -> void   // 只在键不存在时写，不覆盖已有值
+// checkQuota / consumeQuota 也导出，签名同 §5（单键版本）
+
+// core/llm/service.js
+createLlmService({client?, getClient?, store, provider, env?, now?}) -> service
+  service.explain({problem, level?, sessionId?})    -> {text, model}
+  service.hint({problem, level, sessionId?})        -> {text, model}
+  service.gradeIdea({problem, idea, sessionId?})    -> {verdict, comment, model}
+  service.generate({track, topics?, difficulty?, sessionId?}) -> {problem, model, file}
+  service.fill({problem, sessionId?})               -> {problem, model, file}
+  service.describe(sessionId?)                      -> 见 §10.3
+readLlmSettings(store) -> {enabled, provider, model, baseUrl}
+writeLlmSettings(store, patch) -> 同上   // **只认这四个字段，密钥永远不写**
+```
+
+### 10.2 五个场景接口的实际形状
+
+`sessionId` 是**可选**的：成本护栏按「单次会话」计数要用；不传就落到 `default` 桶。
+
+| 接口 | 入参 | 响应 |
+|---|---|---|
+| `POST /api/llm/explain` | `{problemId, level?, sessionId?}` | `{text, model}` |
+| `POST /api/llm/hint` | `{problemId, level, sessionId?}` | `{text, model}` |
+| `POST /api/llm/grade-idea` | `{problemId, idea, sessionId?}` | `{verdict, comment, model}` |
+| `POST /api/bank/llm-generate` | `{track, topics[], difficulty?, sessionId?}` | `{problem, model}` |
+| `POST /api/llm/fill` | `{problemId, sessionId?}` | `{problem, model}` |
+
+- `explain` 的 `level` 缺省是 `思路`；`hint` 的 `level` 非法（不在四档里）回 **400**。
+- `verdict` 归一成 `correct` / `partial` / `wrong` / `unknown` 四个值。
+- `generate` 与 `fill` **真的落盘**：`generate` 新建 `learning/bank/<track>/<llm-题号>.md`（`source: llm`）；
+  `fill` **只补缺的部分**——原来有的题面与用例一律保留，写回后 `needs_fill` 变成 `false`。
+- **不主动泄题**：`explain` 与 `hint` 的提示词**根本不读** `problem.solution`，
+  只有显式选「代码」档才允许给出完整代码。
+
+### 10.3 LLM 设置接口
+
+| 接口 | 响应 |
+|---|---|
+| `GET /api/llm/settings` | 见下方 |
+| `PUT /api/llm/settings` | `{ok: true, settings: {enabled, provider, model, baseUrl}}` |
+
+`GET /api/llm/settings` 的完整响应：
+
+```js
+{
+  enabled: true,              // settings 表里的开关
+  provider: "",               // settings 表里的 provider（空＝按密钥推断）
+  model: "",                  // settings 表里的模型名（空＝用默认）
+  baseUrl: "",                // settings 表里的地址（空＝用默认）
+  effectiveProvider: "null",  // 实际生效的 provider："ark" | "anthropic" | "null"
+  effectiveModel: "null",
+  keySource: "环境变量 ARK_API_KEY",   // **只报变量名，绝不回显密钥**
+  reason: "没有配置 provider，也没有找到 ARK_API_KEY 或 ANTHROPIC_API_KEY",
+  tracks: ["interview", "fundamentals", "advanced", "engineering"],
+  difficulties: ["easy", "medium", "hard"],
+  quota: {sessionLimit: 20, dailyLimit: 100, usedSession: 0, usedDaily: 0},
+}
+```
+
+- `tracks` 与 `difficulties` 直接透出 M1 冻结的 `TRACKS` / `DIFFICULTIES`，
+  **前端不自己硬编码一份**（否则两边会漂）。
+- `GET` 可带 `?sessionId=`，用于报当前会话已用次数。
+- `PUT` **只接受这四个字段**：`enabled` / `provider` / `model` / `baseUrl`。
+  传 `apiKey` / `key` / `token` 一律**忽略**——服务端根本没有写密钥的代码路径（G27）。
+
+### 10.4 错误状态码
+
+M6 的路由**不改 M1 的错误处理**，只在自己的文件里把业务错误转成 `HttpError`：
+
+| 状态码 | 什么时候 | 例子 |
+|---|---|---|
+| 400 | 参数不对 | 「求助档位非法：神级」「这道题已经生成过了」 |
+| 404 | 题号不存在 | `{error: "题目不存在", id}` |
+| 429 | 成本护栏拦住了 | 「本次会话的 LLM 请求次数已用完…」「今天用完了：…」 |
+| 503 | LLM 没开或没装配 | 「【LLM 未启用】…不受影响。」 |
+
+> **关闭态的行为约定**（G23）：LLM 关着时，`explain` / `hint` **仍然回 200**，
+> 正文是一句明确的中文提示；`gradeIdea` 回 200 且 `verdict: "unknown"`；
+> `generate` / `fill` 回 **503**（不是 500），且**绝不改动题库文件**。
+> 其余接口（题库、判题、复习、进度）完全不受影响。
+
+### 10.5 settings 表里的键（M6 的全部落点）
+
+**不新增数据表**（G30），M6 的东西全落在 M1 已有的 `settings` 表里：
+
+| 键 | 作用 |
+|---|---|
+| `llm.enabled` / `llm.provider` / `llm.model` / `llm.base_url` | LLM 设置（**没有密钥键**） |
+| `llm.quota.session_limit` / `llm.quota.daily_limit` | 两个上限，默认 20 / 100 |
+| `llm.quota.session.<sessionId>` | 该会话已用次数 |
+| `llm.quota.daily.<YYYY-MM-DD>` | 当天已用次数 |
+| `llm.trace.<problemId>` | 该题的调用留痕（JSON 数组，每题最多 20 条） |
+
+留痕的每一条：`{ts, kind, level, model, prompt: {digest, length, head}}`——
+只存提示词的 **sha1 指纹 + 长度 + 开头 120 字**，不整段存（G25）。
+
+### 10.6 密钥的来源约定（G27）
+
+- 密钥**只从环境变量读**：`ARK_API_KEY`（火山方舟）或 `ANTHROPIC_API_KEY`。
+- **绝不**写进 `settings` 表、**绝不**写进代码、**绝不**进 git、**绝不**出现在接口响应里。
+- `server/main.js` 的 `loadDotEnv(file?)` 读 `apps/algo-plan/.env`；
+  **已存在的环境变量优先，`.env` 不覆盖**。
+- 上限也能从环境变量调：`ALGO_PLAN_LLM_SESSION_LIMIT` / `ALGO_PLAN_LLM_DAILY_LIMIT`。
+- 总开关：`ALGO_PLAN_LLM_ENABLED`（`0` / `false` / `off` = 关）；
+  provider：`ALGO_PLAN_LLM_PROVIDER`（`ark` / `anthropic` / `null`）；
+  模型：`ALGO_PLAN_LLM_MODEL`；地址：`ALGO_PLAN_LLM_BASE_URL` / `ARK_BASE_URL`。
+
+### 10.7 前端接线约定
+
+- M6 的前端代码**全部在 `web/llm.js`**——`web/app.js` **一个字都没改**。
+- 面板在 `DOMContentLoaded` 之后挂到 `main#view` 顶部，
+  用 `MutationObserver` 盯着 `app.js` 的重渲染，掉了就重新挂。
+- 页面上出现带 `data-problem-id` 的元素就自动认作「当前题」；认不出就用面板自带的题目下拉框。
+- 求助四档**逐级解锁**，进度存 `sessionStorage`（键前缀 `algo-plan-llm-unlock-`），关掉浏览器就没了。
+- 设置请求体由 `settingsRequestBody(patch)` 生成，**只保留四个白名单字段**。
