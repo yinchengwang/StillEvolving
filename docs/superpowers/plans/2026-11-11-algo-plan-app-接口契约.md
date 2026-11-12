@@ -453,3 +453,86 @@ const provider = new FileProvider(bankRoots)
 
 `GET /api/bank` 的摘要项（`toSummary`）也带上 `url` / `searchUrl`，
 前端据此给出「去原题」/「去源站搜索」——两个都没有就明说没有，不装死链。
+
+---
+
+## 9. M5 落地后的契约增量
+
+M5 实现完成后，把 §4 的接口补成实际落地的形状（**加字段，不改旧字段**）。
+
+### 9.1 `GET /api/insights`
+
+查询参数：`?days=N`（默认 `30`，`0`＝全部不补 0，上限 `365`；非法值回退默认）。
+
+```js
+{
+  topics: [{
+    topic: "数组",
+    mastery: 0.2836,
+    coverage: 0.4,
+    bucket: "weak-sparse",
+    label: "薄弱且练得少",
+    action: "轮次里优先排这类题——先补量",
+    attempts: 4,
+    firstPass: 1,
+    lapses: 2,
+    lastAt: "2026-11-10T09:00:00.000Z",
+    expected: 5,
+    expectedSource: "floor",     // "override" | "bank" | "floor"
+    problems: 2,
+  }],
+  summary: {
+    topicCount: 2,
+    untouchedTopics: 1,
+    weakCount: 1,
+    strongCount: 1,
+    avgMastery: 0.4061,
+    avgCoverage: 0.3,
+    totalAttempts: 4,
+    totalProblems: 2,
+    lastPracticeAt: "2026-11-10T09:00:00.000Z",
+    minExpectedQuestions: 5,
+    windowDays: 30,
+    windowAttempts: 4,
+  },
+  series: [{ date: "2026-11-01", count: 0 }],
+}
+```
+
+**排序契约**：`topics` 按处置优先级排——
+「练过但总错（weak-dense）→ 薄弱且练得少（weak-sparse）→ 偶然会，没练透（strong-sparse）→ 掌握（strong-dense）」，
+同一档内按掌握度**升序**（最该治的在前）。
+
+**总数口径**：`summary.totalAttempts` / `totalProblems` **从原始流水算**，
+不按知识点加总——一道题挂多个知识点时，按知识点加总会把同一次提交数两遍。
+
+### 9.2 期望题量的 settings 键
+
+| 键 | 作用 | 默认 |
+|---|---|---|
+| `insights.expected_min_questions` | 所有知识点的期望题量下限 | `5` |
+| `insights.expected_override.<topic>` | 单个知识点的期望题量 | 无 |
+
+合成规则：`期望题量 = max(题库题数, 下限常量)`；手工覆盖值优先级最高。
+
+### 9.3 `topics` 表是物化视图
+
+M5 每次调 `/api/insights` 都从 `attempts` 表**重新派生**，
+再用 `store.replaceTopics(rows)` **整体覆盖** `topics` 表——幂等，
+反复调接口不会把数字累加上去。M1 的 `upsertTopic`（累加写法）保留不动，
+M3/M4 若还在用它写增量也不受影响：M5 每次都会用派生结果覆盖回去。
+
+### 9.4 新增的 store 方法（只做加法）
+
+| 方法 | 返回 |
+|---|---|
+| `store.listAttemptSummaries()` | `[{id, problem_id, ts, verdict}]`——**不带 `code` 列** |
+| `store.countAttemptsByDay()` | `[{date, count}]`（`substr(ts,1,10)` 分组） |
+| `store.replaceTopics(rows)` | `void`（先 `DELETE FROM topics` 再批量插入） |
+
+### 9.5 路由文件约定
+
+M5 的路由放在 `server/api-insights.js`（导出 `buildInsightRoutes(ctx)`），
+在 `server/app.js` 里**合并**进 `server/api.js` 的同一张路由表。
+**M5 完全不改 `server/api.js`**——M3 整体替换过它、M4 替换过整个 `buildRoutes`，
+再来一次整体覆盖就会把 `POST /api/attempt` 和 M4 的五条接口一起删掉。
